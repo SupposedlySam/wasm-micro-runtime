@@ -1002,6 +1002,7 @@ check_global_init_expr(const WASMModule *module, uint32 global_index,
 static WASMStructObjectRef
 instantiate_struct_global_recursive(WASMModule *module,
                                     WASMModuleInstance *module_inst,
+                                    WASMGlobalInstance *globals,
                                     uint32 type_idx, uint8 flag,
                                     WASMStructNewInitValues *init_values,
                                     char *error_buf, uint32 error_buf_size)
@@ -1038,6 +1039,24 @@ instantiate_struct_global_recursive(WASMModule *module,
                 field_ref_type = ref_type_map->ref_type;
             }
 
+            /* A field initialized by global.get (dart2wasm builds a shared
+               constant object graph this way) resolves to the referenced,
+               already-initialized global's value. This handles ref fields of
+               any kind up front — including array-typed fields, which the
+               struct/func dispatch below does not support. */
+            if (init_values->field_init_types
+                && init_values->field_init_types[field_idx]
+                       == INIT_EXPR_TYPE_GET_GLOBAL) {
+                WASMValue field_value =
+                    globals[init_values->fields[field_idx].global_index]
+                        .initial_value;
+                wasm_struct_obj_set_field(struct_obj, field_idx, &field_value);
+                if (wasm_is_type_multi_byte_type(field_type)) {
+                    ref_type_map++;
+                }
+                continue;
+            }
+
             if (wasm_reftype_is_subtype_of(field_type, field_ref_type,
                                            REF_TYPE_STRUCTREF, NULL,
                                            module->types, module->type_count)
@@ -1065,7 +1084,7 @@ instantiate_struct_global_recursive(WASMModule *module,
                         (WASMStructNewInitValues *)wasm_value->data;
                     WASMStructObjectRef field =
                         instantiate_struct_global_recursive(
-                            module, module_inst, heap_type,
+                            module, module_inst, globals, heap_type,
                             init_values1 ? INIT_EXPR_TYPE_STRUCT_NEW
                                          : INIT_EXPR_TYPE_STRUCT_NEW_DEFAULT,
                             init_values1, error_buf, error_buf_size);
@@ -1357,8 +1376,8 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
                 }
 
                 struct_obj = instantiate_struct_global_recursive(
-                    module, module_inst, type_idx, flag, init_values, error_buf,
-                    error_buf_size);
+                    module, module_inst, globals, type_idx, flag, init_values,
+                    error_buf, error_buf_size);
                 if (!struct_obj) {
                     goto fail;
                 }

@@ -547,42 +547,28 @@ destroy_init_expr_data_recursive(WASMModule *module, void *data)
     bh_assert(wasm_type->type_flag == WASM_TYPE_STRUCT
               || wasm_type->type_flag == WASM_TYPE_ARRAY);
 
-    if (wasm_type->type_flag == WASM_TYPE_STRUCT) {
-        WASMStructType *struct_type = (WASMStructType *)wasm_type;
-        WASMRefType *ref_type;
-        uint8 field_type;
-
-        uint16 ref_type_map_index = 0;
+    /* Only fields/elements that were themselves struct.new / array.new /
+       array.new_fixed own a nested `.data` allocation to recurse into. Other
+       constant-expression kinds (global.get, ref.*, *_default, scalars) store
+       a value in-place, not a pointer, so recursing on them would dereference
+       a non-pointer (the original crash). Use the recorded per-field kinds. */
+    if (wasm_type->type_flag == WASM_TYPE_STRUCT
+        && struct_init_values->field_init_types) {
         for (i = 0; i < struct_init_values->count; i++) {
-            field_type = struct_type->fields[i].field_type;
-            if (wasm_is_type_multi_byte_type(field_type))
-                ref_type =
-                    struct_type->ref_type_maps[ref_type_map_index++].ref_type;
-            else
-                ref_type = NULL;
-            if (wasm_reftype_is_subtype_of(field_type, ref_type,
-                                           REF_TYPE_STRUCTREF, NULL,
-                                           module->types, module->type_count)
-                || wasm_reftype_is_subtype_of(
-                    field_type, ref_type, REF_TYPE_ARRAYREF, NULL,
-                    module->types, module->type_count)) {
+            uint8 t = struct_init_values->field_init_types[i];
+            if (t == INIT_EXPR_TYPE_STRUCT_NEW || t == INIT_EXPR_TYPE_ARRAY_NEW
+                || t == INIT_EXPR_TYPE_ARRAY_NEW_FIXED) {
                 destroy_init_expr_data_recursive(
                     module, struct_init_values->fields[i].data);
             }
         }
     }
-    else if (wasm_type->type_flag == WASM_TYPE_ARRAY) {
-        WASMArrayType *array_type = (WASMArrayType *)wasm_type;
-        WASMRefType *elem_ref_type = array_type->elem_ref_type;
-        uint8 elem_type = array_type->elem_type;
-
+    else if (wasm_type->type_flag == WASM_TYPE_ARRAY
+             && array_init_values->elem_init_types) {
         for (i = 0; i < array_init_values->length; i++) {
-            if (wasm_reftype_is_subtype_of(elem_type, elem_ref_type,
-                                           REF_TYPE_STRUCTREF, NULL,
-                                           module->types, module->type_count)
-                || wasm_reftype_is_subtype_of(
-                    elem_type, elem_ref_type, REF_TYPE_ARRAYREF, NULL,
-                    module->types, module->type_count)) {
+            uint8 t = array_init_values->elem_init_types[i];
+            if (t == INIT_EXPR_TYPE_STRUCT_NEW || t == INIT_EXPR_TYPE_ARRAY_NEW
+                || t == INIT_EXPR_TYPE_ARRAY_NEW_FIXED) {
                 destroy_init_expr_data_recursive(
                     module, array_init_values->elem_data[i].data);
             }
@@ -1193,12 +1179,19 @@ load_init_expr(WASMModule *module, const uint8 **p_buf, const uint8 *buf_end,
 
                         if (!(struct_init_values = loader_malloc(
                                   offsetof(WASMStructNewInitValues, fields)
-                                      + (uint64)field_count * sizeof(WASMValue),
+                                      + (uint64)field_count * sizeof(WASMValue)
+                                      + (uint64)field_count * sizeof(uint8),
                                   error_buf, error_buf_size))) {
                             goto fail;
                         }
                         struct_init_values->type_idx = type_idx;
                         struct_init_values->count = field_count;
+                        /* Per-field init-expr kinds live right after fields[];
+                           zero-initialized by loader_malloc (0 == not a nested
+                           data pointer), so partial-populate error paths are
+                           safe for cleanup. */
+                        struct_init_values->field_init_types =
+                            (uint8 *)&struct_init_values->fields[field_count];
 
                         for (i = field_count; i > 0; i--) {
                             WASMRefType *field_ref_type = NULL;
@@ -1216,8 +1209,10 @@ load_init_expr(WASMModule *module, const uint8 **p_buf, const uint8 *buf_end,
                             }
 
                             if (!pop_const_expr_stack(
-                                    &const_expr_ctx, NULL, field_type,
-                                    field_ref_type, NULL,
+                                    &const_expr_ctx,
+                                    &struct_init_values
+                                         ->field_init_types[field_idx],
+                                    field_type, field_ref_type, NULL,
                                     &struct_init_values->fields[field_idx],
 #if WASM_ENABLE_EXTENDED_CONST_EXPR != 0
                                     NULL,
@@ -1329,8 +1324,10 @@ load_init_expr(WASMModule *module, const uint8 **p_buf, const uint8 *buf_end,
                                 }
 
                                 size =
-                                    sizeof(WASMArrayNewInitValues)
-                                    + sizeof(WASMValue) * (uint64)len_val.i32;
+                                    (uint64)offsetof(WASMArrayNewInitValues,
+                                                     elem_data)
+                                    + sizeof(WASMValue) * (uint64)len_val.i32
+                                    + sizeof(uint8) * (uint64)len_val.i32;
                                 if (!(array_init_values = loader_malloc(
                                           size, error_buf, error_buf_size))) {
                                     goto fail;
@@ -1338,10 +1335,15 @@ load_init_expr(WASMModule *module, const uint8 **p_buf, const uint8 *buf_end,
 
                                 array_init_values->type_idx = type_idx;
                                 array_init_values->length = len_val.i32;
+                                array_init_values->elem_init_types =
+                                    (uint8 *)&array_init_values
+                                        ->elem_data[len_val.i32];
 
+                                /* array.new repeats a single element value */
                                 if (!pop_const_expr_stack(
-                                        &const_expr_ctx, NULL, elem_type,
-                                        elem_ref_type, NULL,
+                                        &const_expr_ctx,
+                                        &array_init_values->elem_init_types[0],
+                                        elem_type, elem_ref_type, NULL,
                                         &array_init_values->elem_data[0],
 #if WASM_ENABLE_EXTENDED_CONST_EXPR != 0
                                         NULL,
@@ -1362,7 +1364,8 @@ load_init_expr(WASMModule *module, const uint8 **p_buf, const uint8 *buf_end,
                                 total_size =
                                     (uint64)offsetof(WASMArrayNewInitValues,
                                                      elem_data)
-                                    + (uint64)sizeof(WASMValue) * len;
+                                    + (uint64)sizeof(WASMValue) * len
+                                    + (uint64)sizeof(uint8) * len;
                                 if (!(array_init_values =
                                           loader_malloc(total_size, error_buf,
                                                         error_buf_size))) {
@@ -1371,11 +1374,15 @@ load_init_expr(WASMModule *module, const uint8 **p_buf, const uint8 *buf_end,
 
                                 array_init_values->type_idx = type_idx;
                                 array_init_values->length = len;
+                                array_init_values->elem_init_types =
+                                    (uint8 *)&array_init_values->elem_data[len];
 
                                 for (i = len; i > 0; i--) {
                                     if (!pop_const_expr_stack(
-                                            &const_expr_ctx, NULL, elem_type,
-                                            elem_ref_type, NULL,
+                                            &const_expr_ctx,
+                                            &array_init_values
+                                                 ->elem_init_types[i - 1],
+                                            elem_type, elem_ref_type, NULL,
                                             &array_init_values
                                                  ->elem_data[i - 1],
 #if WASM_ENABLE_EXTENDED_CONST_EXPR != 0

@@ -270,12 +270,19 @@ typedef union WASMValue {
 typedef struct WASMStructNewInitValues {
     uint32 type_idx;
     uint32 count;
+    /* Per-field constant-expression kind (INIT_EXPR_TYPE_*), so consumers know
+       whether fields[i] is a nested struct.new/array.new `.data` pointer, a
+       global.get index, a ref, or a scalar. Points into the same allocation,
+       right after fields[count]; NULL if the producer didn't record types. */
+    uint8 *field_init_types;
     WASMValue fields[1];
 } WASMStructNewInitValues;
 
 typedef struct WASMArrayNewInitValues {
     uint32 type_idx;
     uint32 length;
+    /* Per-element constant-expression kind (INIT_EXPR_TYPE_*); see above. */
+    uint8 *elem_init_types;
     WASMValue elem_data[1];
 } WASMArrayNewInitValues;
 
