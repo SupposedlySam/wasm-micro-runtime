@@ -1057,6 +1057,25 @@ instantiate_struct_global_recursive(WASMModule *module,
                 continue;
             }
 
+            /* A field whose init-expr is ref.null must be written as a null
+               reference even when the field TYPE is a struct/array/func ref.
+               Otherwise the type-based branch below recurses with NULL
+               init-values and STRUCT_NEW_DEFAULT, fabricating an all-zero
+               default struct (the dart2wasm class_id-0 sentinel) where null
+               belongs -- e.g. const PersistentHashMap.empty()._root, which then
+               virtually-dispatches on the sentinel. (Struct analogue of the
+               array.new_fixed global-init fix.) */
+            if (init_values->field_init_types
+                && init_values->field_init_types[field_idx]
+                       == INIT_EXPR_TYPE_REFNULL_CONST) {
+                WASMValue null_value = { 0 };
+                wasm_struct_obj_set_field(struct_obj, field_idx, &null_value);
+                if (wasm_is_type_multi_byte_type(field_type)) {
+                    ref_type_map++;
+                }
+                continue;
+            }
+
             if (wasm_reftype_is_subtype_of(field_type, field_ref_type,
                                            REF_TYPE_STRUCTREF, NULL,
                                            module->types, module->type_count)
