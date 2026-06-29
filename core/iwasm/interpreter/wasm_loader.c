@@ -4814,11 +4814,15 @@ load_init_expr_vec(const uint8 **p_buf, const uint8 *buf_end,
                             error_buf, error_buf_size))
             return false;
 
+        /* pebble/dart2wasm: element-segment init-exprs may also be i31.new
+           (0xD8) or any/extern-convert const-exprs (0xD9/0xDA) -- all valid
+           WasmGC constant expressions that load_init_expr above already
+           parses + validates. Extend the accepted range past ARRAY_NEW_FIXED. */
         bh_assert((init_expr->init_expr_type == INIT_EXPR_TYPE_GET_GLOBAL)
                   || (init_expr->init_expr_type == INIT_EXPR_TYPE_REFNULL_CONST)
                   || (init_expr->init_expr_type >= INIT_EXPR_TYPE_FUNCREF_CONST
                       && init_expr->init_expr_type
-                             <= INIT_EXPR_TYPE_ARRAY_NEW_FIXED));
+                             <= INIT_EXPR_TYPE_EXTERN_CONVERT_ANY));
     }
 
     *p_buf = p;
