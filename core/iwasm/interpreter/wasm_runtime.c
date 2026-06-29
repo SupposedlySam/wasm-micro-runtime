@@ -1130,7 +1130,8 @@ instantiate_struct_global_recursive(WASMModule *module,
 static WASMArrayObjectRef
 instantiate_array_global_recursive(WASMModule *module,
                                    WASMModuleInstance *module_inst,
-                                   uint32 type_idx, uint8 flag, uint32 len,
+                                   WASMGlobalInstance *globals, uint32 type_idx,
+                                   uint8 flag, uint32 len,
                                    WASMValue *array_init_value,
                                    WASMArrayNewInitValues *init_values,
                                    char *error_buf, uint32 error_buf_size)
@@ -1162,21 +1163,80 @@ instantiate_array_global_recursive(WASMModule *module,
 
         bh_assert(init_values);
 
-        if (wasm_reftype_is_subtype_of(elem_type, elem_ref_type,
-                                       REF_TYPE_STRUCTREF, NULL, module->types,
-                                       module->type_count)
-            || wasm_reftype_is_subtype_of(elem_type, elem_ref_type,
-                                          REF_TYPE_ARRAYREF, NULL,
-                                          module->types, module->type_count)
-            || wasm_reftype_is_subtype_of(elem_type, elem_ref_type,
-                                          REF_TYPE_FUNCREF, NULL, module->types,
-                                          module->type_count)) {
-            /* TODO */
-        }
-
         for (elem_idx = 0; elem_idx < len; elem_idx++) {
-            wasm_array_obj_set_elem(array_obj, elem_idx,
-                                    &init_values->elem_data[elem_idx]);
+            uint8 elem_init_type =
+                init_values->elem_init_types
+                    ? init_values->elem_init_types[elem_idx]
+                    : (uint8)0xff;
+            WASMValue *elem_src = &init_values->elem_data[elem_idx];
+
+            /* An element initialized by global.get (dart2wasm builds a shared
+               constant object graph this way) resolves to the referenced,
+               already-initialized global's value. Mirrors the struct path;
+               without this the raw global index is written into a ref slot,
+               yielding a split/garbage pointer that later SIGBUSes. */
+            if (elem_init_type == INIT_EXPR_TYPE_GET_GLOBAL) {
+                WASMValue elem_value =
+                    globals[elem_src->global_index].initial_value;
+                wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
+            }
+            /* A nested struct/array element must be instantiated recursively
+               into a real object before it can be stored. */
+            else if (elem_init_type == INIT_EXPR_TYPE_STRUCT_NEW
+                     || elem_init_type == INIT_EXPR_TYPE_STRUCT_NEW_DEFAULT) {
+                WASMValue elem_value = { 0 };
+                WASMStructNewInitValues *sub =
+                    (elem_init_type == INIT_EXPR_TYPE_STRUCT_NEW)
+                        ? (WASMStructNewInitValues *)elem_src->data
+                        : NULL;
+                /* type_idx of the concrete struct: from the recorded init
+                   values when present, else the array's element heap type. */
+                int32 sub_type_idx =
+                    sub ? (int32)sub->type_idx
+                        : ((elem_ref_type
+                            && wasm_is_refheaptype_typeidx(
+                                &elem_ref_type->ref_ht_common))
+                               ? elem_ref_type->ref_ht_typeidx.type_idx
+                               : (int32)array_type->elem_type);
+                WASMStructObjectRef sub_obj = instantiate_struct_global_recursive(
+                    module, module_inst, globals, (uint32)sub_type_idx,
+                    elem_init_type, sub, error_buf, error_buf_size);
+                if (!sub_obj)
+                    return NULL;
+                elem_value.gc_obj = (WASMObjectRef)sub_obj;
+                wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
+            }
+            else if (elem_init_type == INIT_EXPR_TYPE_ARRAY_NEW
+                     || elem_init_type == INIT_EXPR_TYPE_ARRAY_NEW_DEFAULT
+                     || elem_init_type == INIT_EXPR_TYPE_ARRAY_NEW_FIXED) {
+                WASMValue elem_value = { 0 };
+                WASMArrayNewInitValues *sub =
+                    (elem_init_type == INIT_EXPR_TYPE_ARRAY_NEW_DEFAULT)
+                        ? NULL
+                        : (WASMArrayNewInitValues *)elem_src->data;
+                WASMValue empty = { 0 };
+                WASMValue *sub_init =
+                    (elem_init_type == INIT_EXPR_TYPE_ARRAY_NEW && sub)
+                        ? sub->elem_data
+                        : &empty;
+                uint32 sub_type_idx = sub ? sub->type_idx
+                                          : elem_src->array_new_default.type_index;
+                uint32 sub_len = sub ? sub->length
+                                     : elem_src->array_new_default.length;
+                WASMArrayObjectRef sub_obj = instantiate_array_global_recursive(
+                    module, module_inst, globals, sub_type_idx, elem_init_type,
+                    sub_len, sub_init, sub, error_buf, error_buf_size);
+                if (!sub_obj)
+                    return NULL;
+                elem_value.gc_obj = (WASMObjectRef)sub_obj;
+                wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
+            }
+            /* Plain constant (i31.new, ref.null, i32/i64, etc.): the value
+               is self-contained in elem_data. */
+            else {
+                (void)elem_type;
+                wasm_array_obj_set_elem(array_obj, elem_idx, elem_src);
+            }
         }
     }
 
@@ -1412,8 +1472,8 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
                 }
 
                 array_obj = instantiate_array_global_recursive(
-                    module, module_inst, type_idx, flag, len, array_init_value,
-                    init_values, error_buf, error_buf_size);
+                    module, module_inst, globals, type_idx, flag, len,
+                    array_init_value, init_values, error_buf, error_buf_size);
 
                 global->initial_value.gc_obj = (void *)array_obj;
                 break;
