@@ -1047,9 +1047,33 @@ instantiate_struct_global_recursive(WASMModule *module,
             if (init_values->field_init_types
                 && init_values->field_init_types[field_idx]
                        == INIT_EXPR_TYPE_GET_GLOBAL) {
-                WASMValue field_value =
-                    globals[init_values->fields[field_idx].global_index]
-                        .initial_value;
+                uint32 src_gidx = init_values->fields[field_idx].global_index;
+                WASMValue field_value = globals[src_gidx].initial_value;
+                /* A referenced funcref global's initial_value still holds the
+                   RAW function index at this point: funcref globals defer the
+                   index -> WASMFuncObject conversion to the global_data store
+                   pass (see globals_instantiate, INIT_EXPR_TYPE_FUNCREF_CONST),
+                   which runs AFTER struct/vtable globals are built. Writing the
+                   raw index into a (ref func) field yields a fake pointer whose
+                   low 32 bits are the func index -> the GC later derefs it and
+                   crashes. Resolve to a real func object here. (dart2wasm builds
+                   #Vtable structs as global.get of per-method funcref globals.)
+                */
+                if (src_gidx >= module->import_global_count) {
+                    InitializerExpression *src_init =
+                        &module->globals[src_gidx - module->import_global_count]
+                             .init_expr;
+                    if (src_init->init_expr_type
+                            == INIT_EXPR_TYPE_FUNCREF_CONST
+                        && (uint32)field_value.i32 != UINT32_MAX) {
+                        WASMFuncObjectRef func_obj = wasm_create_func_obj(
+                            module_inst, (uint32)field_value.i32, false,
+                            error_buf, error_buf_size);
+                        if (!func_obj)
+                            return NULL;
+                        field_value.gc_obj = (WASMObjectRef)func_obj;
+                    }
+                }
                 wasm_struct_obj_set_field(struct_obj, field_idx, &field_value);
                 if (wasm_is_type_multi_byte_type(field_type)) {
                     ref_type_map++;
