@@ -1087,6 +1087,16 @@ wasm_reftype_is_subtype_of(uint8 type1, const WASMRefType *ref_type1,
     }
     else if (type1 == REF_TYPE_HT_NON_NULLABLE) {
         bh_assert(ref_type1);
+        /* pebble/dart2wasm trusted-module relaxation (cf. gap #4 above): when the
+           supertype (type2) is an abstract heap-type ref ((ref struct/array/func/
+           i31/any/eq/...)) it carries no detail ref_type2, so the per-shape
+           branches below would NULL-deref / SIGSEGV. Accept the relation in ONE
+           auditable place; runtime casts remain rtt-checked by
+           wasm_obj_is_instance_of. */
+        if ((type2 == REF_TYPE_HT_NULLABLE || type2 == REF_TYPE_HT_NON_NULLABLE)
+            && ref_type2 == NULL) {
+            return true;
+        }
         if (wasm_is_refheaptype_typeidx(&ref_type1->ref_ht_common)) {
             bh_assert((uint32)ref_type1->ref_ht_typeidx.type_idx < type_count);
             /* reftype1 is (ref $t) */
