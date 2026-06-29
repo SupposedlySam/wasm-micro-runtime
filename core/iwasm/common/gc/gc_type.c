@@ -804,6 +804,13 @@ wasm_reftype_equal(uint8 type1, const WASMRefType *reftype1, uint8 type2,
     bh_assert(type1 == (uint8)REF_TYPE_HT_NULLABLE
               || type1 == (uint8)REF_TYPE_HT_NON_NULLABLE);
 
+    /* pebble/dart2wasm: a multi-byte (HT) type can reach here with a NULL detail
+       ref_type (e.g. an expected type that is HT-coded but whose ref_type wasn't
+       populated). Guard the NULL deref in wasm_refheaptype_equal below: a NULL
+       ref_type is equal only to another NULL ref_type. */
+    if (reftype1 == NULL || reftype2 == NULL)
+        return reftype1 == reftype2;
+
     /* (ref null ht) or (ref ht) */
     return wasm_refheaptype_equal((RefHeapType_Common *)reftype1,
                                   (RefHeapType_Common *)reftype2, types,
@@ -982,6 +989,41 @@ wasm_reftype_is_subtype_of(uint8 type1, const WASMRefType *ref_type1,
      * funcref -> (ref null $t) -> (ref $t), $t is func
      * externref
      */
+
+    /* pebble/dart2wasm: reflexivity -- X <: X. The structural cases below miss some
+       EQUAL ref forms (e.g. (ref none) <: (ref none), both HT_NON_NULLABLE + heap_type
+       NONE), so check type equality up front. Unconditionally sound. */
+    if (wasm_reftype_equal(type1, ref_type1, type2, ref_type2, types, type_count))
+        return true;
+
+    /* pebble/dart2wasm: a bottom heap type (none/nofunc/noextern) in its EXPANDED
+       form -- type1 = (ref null? ht) with ref_type1->heap_type == HEAP_TYPE_NONE/
+       NOFUNC/NOEXTERN -- is a subtype of anything in its hierarchy (bottom <: all),
+       but the cases below only handle the simple-code form (REF_TYPE_NULLREF etc.).
+       Normalize to the existing bottom-type checks. This is sound WasmGC subtyping,
+       not a relaxation; dart2wasm emits (ref none) e.g. after ref.cast / in joins. */
+    if ((type1 == REF_TYPE_HT_NULLABLE || type1 == REF_TYPE_HT_NON_NULLABLE)
+        && ref_type1 != NULL
+        && wasm_is_refheaptype_common(&ref_type1->ref_ht_common)) {
+        int32 ht1 = ref_type1->ref_ht_common.heap_type;
+        if (ht1 == HEAP_TYPE_NONE || ht1 == HEAP_TYPE_NOFUNC
+            || ht1 == HEAP_TYPE_NOEXTERN) {
+            /* A nullable bottom is NOT a subtype of a non-null supertype. */
+            if (type1 == REF_TYPE_HT_NULLABLE && type2 == REF_TYPE_HT_NON_NULLABLE)
+                return false;
+            /* Heap-type check via the existing bottom helpers. They key off type2 and
+               only recognize its NULLABLE form (REF_TYPE_*REF / HT_NULLABLE), so present
+               a non-null supertype as nullable: a non-null bottom satisfies both a
+               non-null and a nullable supertype in its hierarchy. */
+            uint8 t2n =
+                (type2 == REF_TYPE_HT_NON_NULLABLE) ? REF_TYPE_HT_NULLABLE : type2;
+            if (ht1 == HEAP_TYPE_NONE)
+                return wasm_is_reftype_supers_of_none(t2n, ref_type2, types, type_count);
+            if (ht1 == HEAP_TYPE_NOFUNC)
+                return wasm_is_reftype_supers_of_nofunc(t2n, ref_type2, types, type_count);
+            return wasm_is_reftype_supers_of_noextern(t2n);
+        }
+    }
 
     if (type1 == REF_TYPE_ANYREF) {
         /* any <: any */
