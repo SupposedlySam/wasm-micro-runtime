@@ -1142,10 +1142,20 @@ word_copy(uint32 *dest, uint32 *src, unsigned num)
     bh_assert(src != NULL);
     bh_assert(num > 0);
     if (dest != src) {
-        /* No overlap buffer */
-        bh_assert(!((src < dest) && (dest < src + num)));
-        for (; num > 0; num--)
-            *dest++ = *src++;
+        /* The full dart2wasm framework triggers legitimately overlapping operand-
+           stack copies (a multi-value / ref block result shifted upward). The stock
+           impl asserted non-overlap and copied ascending, which corrupts a forward
+           overlap; use memmove semantics: copy descending when dest is ahead. */
+        if (src < dest && dest < src + num) {
+            dest += num;
+            src += num;
+            while (num-- > 0)
+                *--dest = *--src;
+        }
+        else {
+            for (; num > 0; num--)
+                *dest++ = *src++;
+        }
     }
 }
 
@@ -1153,9 +1163,24 @@ word_copy(uint32 *dest, uint32 *src, unsigned num)
 static inline void
 frame_ref_copy(uint8 *frame_ref_dest, uint8 *frame_ref_src, unsigned num)
 {
-    if (frame_ref_dest != frame_ref_src)
-        for (; num > 0; num--)
-            *frame_ref_dest++ = *frame_ref_src++;
+    if (frame_ref_dest != frame_ref_src) {
+        /* Must use memmove semantics for the SAME overlap case word_copy handles:
+           when the operand stack shifts up, the parallel GC ref-bitmap shifts with
+           it. An ascending copy over a forward overlap corrupts the bitmap, so the
+           GC later mis-scans the stack -> non-deterministic SIGSEGV/SIGBUS/gc
+           assert. Copy descending when dest is ahead of src. */
+        if (frame_ref_src < frame_ref_dest
+            && frame_ref_dest < frame_ref_src + num) {
+            frame_ref_dest += num;
+            frame_ref_src += num;
+            while (num-- > 0)
+                *--frame_ref_dest = *--frame_ref_src;
+        }
+        else {
+            for (; num > 0; num--)
+                *frame_ref_dest++ = *frame_ref_src++;
+        }
+    }
 }
 #else
 #define frame_ref_copy(frame_ref_dst, frame_ref_src, num) (void)0
