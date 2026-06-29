@@ -427,6 +427,36 @@ init_frame_refs(uint8 *frame_ref, uint32 cell_num, WASMFunctionInstance *func)
     }
 }
 
+#if WASM_ENABLE_EXCE_HANDLING != 0
+/* Set the GC frame-ref bitmap for a contiguous run of operand-stack cells that
+   hold the values described by the first `value_count` types of `func_type`
+   (e.g. an exception tag's parameter types). A non-i31 reftype occupies
+   REF_CELL_NUM cells all marked 1; everything else is marked 0. Mirrors
+   init_frame_refs. Exception-handling value copies move ref payloads with a
+   plain word_copy and must keep this bitmap in sync, or the GC stack-scan and
+   the ref-aware push/pop machinery mis-track 2-cell refs (corruption). */
+static inline void
+set_frame_refs_from_type(uint8 *frame_ref, const WASMFuncType *func_type,
+                         uint32 value_count)
+{
+    uint32 i, j = 0;
+    for (i = 0; i < value_count; i++) {
+        uint8 vt = func_type->types[i];
+        if (wasm_is_type_reftype(vt) && !wasm_is_reftype_i31ref(vt)) {
+            frame_ref[j++] = 1;
+#if UINTPTR_MAX == UINT64_MAX
+            frame_ref[j++] = 1;
+#endif
+        }
+        else {
+            uint32 n = wasm_value_type_cell_num(vt);
+            while (n-- > 0)
+                frame_ref[j++] = 0;
+        }
+    }
+}
+#endif /* WASM_ENABLE_EXCE_HANDLING != 0 */
+
 uint8 *
 wasm_interp_get_frame_ref(WASMInterpFrame *frame)
 {
@@ -1857,25 +1887,74 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                             UNWIND_CSP(relative_depth,
                                                        LABEL_TYPE_CATCH);
 
-                                            /* push exception_tag_index and
-                                             * exception values for rethrow */
+                                            /* Push, in order, for the catch
+                                             * handler:
+                                             *   [tag][rethrow payload][catch
+                                             *    payload]
+                                             * The exception values are written
+                                             * twice; the destination of the
+                                             * first (rethrow) copy can overlap
+                                             * the source region that the second
+                                             * (catch) copy still needs to read,
+                                             * so stage the source through a temp
+                                             * buffer to avoid clobbering it. On
+                                             * 64-bit a ref is REF_CELL_NUM
+                                             * cells; the GC ref bitmap must be
+                                             * re-established for each copied
+                                             * payload (a plain word_copy does
+                                             * not carry it), or the GC scan and
+                                             * the ref-aware stack machinery
+                                             * mis-track the refs and corrupt
+                                             * them. */
+                                            CLEAR_FRAME_REF(frame_sp, 1);
                                             PUSH_I32(exception_tag_index);
                                             if (cell_num_to_copy > 0) {
-                                                word_copy(
-                                                    frame_sp,
+                                                uint32 *src =
                                                     frame_sp_old
-                                                        - cell_num_to_copy,
-                                                    cell_num_to_copy);
+                                                    - cell_num_to_copy;
+                                                uint32 tmp_buf[64];
+                                                uint32 *tmp = tmp_buf;
+                                                bool heap_tmp =
+                                                    cell_num_to_copy
+                                                    > sizeof(tmp_buf)
+                                                          / sizeof(uint32);
+                                                if (heap_tmp) {
+                                                    tmp = wasm_runtime_malloc(
+                                                        cell_num_to_copy
+                                                        * sizeof(uint32));
+                                                    if (!tmp) {
+                                                        wasm_set_exception(
+                                                            module,
+                                                            "allocate memory "
+                                                            "failed");
+                                                        goto got_exception;
+                                                    }
+                                                }
+                                                bh_memcpy_s(
+                                                    tmp,
+                                                    cell_num_to_copy
+                                                        * sizeof(uint32),
+                                                    src,
+                                                    cell_num_to_copy
+                                                        * sizeof(uint32));
+                                                /* rethrow payload */
+                                                word_copy(frame_sp, tmp,
+                                                          cell_num_to_copy);
+                                                set_frame_refs_from_type(
+                                                    FRAME_REF(frame_sp),
+                                                    tag_type,
+                                                    tag_type->param_count);
                                                 frame_sp += cell_num_to_copy;
-                                                /* push exception values for
-                                                 * catch
-                                                 */
-                                                word_copy(
-                                                    frame_sp,
-                                                    frame_sp_old
-                                                        - cell_num_to_copy,
-                                                    cell_num_to_copy);
+                                                /* catch payload */
+                                                word_copy(frame_sp, tmp,
+                                                          cell_num_to_copy);
+                                                set_frame_refs_from_type(
+                                                    FRAME_REF(frame_sp),
+                                                    tag_type,
+                                                    tag_type->param_count);
                                                 frame_sp += cell_num_to_copy;
+                                                if (heap_tmp)
+                                                    wasm_runtime_free(tmp);
                                             }
 
                                             /* advance to handler */
@@ -1910,6 +1989,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                                       frame_sp_old
                                                           - cell_num_to_copy,
                                                       cell_num_to_copy);
+                                            /* GC: carry the ref bitmap with the
+                                             * delegated exception values. */
+                                            set_frame_refs_from_type(
+                                                FRAME_REF(frame_sp), tag_type,
+                                                tag_type->param_count);
                                             frame_sp += cell_num_to_copy;
                                         }
 
@@ -1931,12 +2015,19 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                                         /* push exception_tag_index and
                                          * exception values for rethrow */
+                                        CLEAR_FRAME_REF(frame_sp, 1);
                                         PUSH_I32(exception_tag_index);
                                         if (cell_num_to_copy > 0) {
                                             word_copy(frame_sp,
                                                       frame_sp_old
                                                           - cell_num_to_copy,
                                                       cell_num_to_copy);
+                                            /* GC: carry the ref bitmap with the
+                                             * rethrow payload (catch_all keeps
+                                             * the values only for rethrow). */
+                                            set_frame_refs_from_type(
+                                                FRAME_REF(frame_sp), tag_type,
+                                                tag_type->param_count);
                                             frame_sp += cell_num_to_copy;
                                         }
                                         /* catch_all has no exception values */
