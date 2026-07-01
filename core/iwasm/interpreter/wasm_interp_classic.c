@@ -5364,6 +5364,19 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     wasm_set_exception(module, "integer divide by zero");
                     goto got_exception;
                 }
+                /* DIAG (throwaway, INV2): the counter bug formats N<<32 for a
+                   small N -- the digit loop's FIRST division sees the already-
+                   swapped dividend. Catch a dividend with the swapped
+                   signature (lo=0, small hi) here to NAME the formatting
+                   function + ip; from there trace where its input came from
+                   (reuses the csp diag ring/readout). */
+                if ((uint32)a == 0 && (uint32)(a >> 32) != 0
+                    && (uint32)(a >> 32) < 4096) {
+                    csp_diag_record(0xd1d1, (uint32)(a >> 32),
+                                    (uint32)(cur_func - module->e->functions),
+                                    (uint32)(frame_ip
+                                             - cur_func->u.func->code));
+                }
                 PUSH_I64(a / b);
                 HANDLE_OP_END();
             }
@@ -5395,6 +5408,15 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 if (b == 0) {
                     wasm_set_exception(module, "integer divide by zero");
                     goto got_exception;
+                }
+                /* DIAG (throwaway, INV2): same swapped-dividend catch as
+                   I64_DIV_U above (digit loops often take rem first). */
+                if ((uint32)a == 0 && (uint32)(a >> 32) != 0
+                    && (uint32)(a >> 32) < 4096) {
+                    csp_diag_record(0xd1d2, (uint32)(a >> 32),
+                                    (uint32)(cur_func - module->e->functions),
+                                    (uint32)(frame_ip
+                                             - cur_func->u.func->code));
                 }
                 PUSH_I64(a % b);
                 HANDLE_OP_END();
