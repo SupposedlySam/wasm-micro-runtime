@@ -107,6 +107,47 @@ wasm_struct_obj_new(WASMExecEnv *exec_env, WASMRttTypeRef rtt_type)
     return wasm_struct_obj_new_internal(heap_handle, rtt_type);
 }
 
+/* ---- DIAG (throwaway, INV2): catch word-swapped i64 struct fields ----
+   The on-device counter bug renders small i64s as N<<32. If the FIELD MEMORY
+   ever holds (lo=0, hi=N!=0) for a small N, the corruption happened on the
+   WRITE side (or was already swapped on the operand stack); if the memory
+   stays healthy while the display still swaps, the corruption is in the
+   read/format path (see the POP_CSP_N diag in wasm_interp_classic.c). The
+   signature requires hi < 4096 to exclude legitimately-large i64s (ns
+   timestamps exceed 2^32). Read via wasm_gc_field_diag(). */
+static struct {
+    uint32 sets, gets;         /* total 8-byte field accesses */
+    uint32 anom_set, anom_get; /* accesses matching the swapped signature */
+    uint32 last_hi, last_off;  /* last anomalous hi word + field offset */
+} g_field_diag;
+
+static void
+field_diag_note(bool is_set, uint64 v, uint32 field_offset)
+{
+    uint32 lo = (uint32)v, hi = (uint32)(v >> 32);
+    if (is_set)
+        g_field_diag.sets++;
+    else
+        g_field_diag.gets++;
+    if (lo == 0 && hi != 0 && hi < 4096) {
+        if (is_set)
+            g_field_diag.anom_set++;
+        else
+            g_field_diag.anom_get++;
+        g_field_diag.last_hi = hi;
+        g_field_diag.last_off = field_offset;
+    }
+}
+
+void
+wasm_gc_field_diag(char *buf, uint32 buf_len)
+{
+    snprintf(buf, buf_len, "f64set=%u/%u f64get=%u/%u last=hi%u@%u",
+             (unsigned)g_field_diag.anom_set, (unsigned)g_field_diag.sets,
+             (unsigned)g_field_diag.anom_get, (unsigned)g_field_diag.gets,
+             (unsigned)g_field_diag.last_hi, (unsigned)g_field_diag.last_off);
+}
+
 void
 wasm_struct_obj_set_field(WASMStructObjectRef struct_obj, uint32 field_idx,
                           const WASMValue *value)
@@ -127,6 +168,7 @@ wasm_struct_obj_set_field(WASMStructObjectRef struct_obj, uint32 field_idx,
         *(int32 *)field_data = value->i32;
     }
     else if (field_size == 8) {
+        field_diag_note(true, (uint64)value->i64, field->field_offset);
 #if defined(BUILD_TARGET_X86_64) || defined(BUILD_TARGET_AMD_64) \
     || defined(BUILD_TARGET_X86_32)
         *(int64 *)field_data = value->i64;
@@ -171,6 +213,7 @@ wasm_struct_obj_get_field(const WASMStructObjectRef struct_obj,
 #else
         value->i64 = GET_I64_FROM_ADDR((uint32 *)field_data);
 #endif
+        field_diag_note(false, (uint64)value->i64, field->field_offset);
     }
     else if (field_size == 1) {
         if (sign_extend)

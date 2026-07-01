@@ -632,6 +632,17 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
         frame_sp = (frame_csp - 1)->frame_sp;                          \
         cell_num_to_copy = (frame_csp - 1)->cell_num;                  \
         if (cell_num_to_copy > 0) {                                    \
+            /* DIAG (throwaway, INV2): an overlap with dest AHEAD of   \
+               src = runtime-vs-validator stack divergence; name the   \
+               site (see csp_diag_record). */                          \
+            if (frame_sp_old - cell_num_to_copy < frame_sp) {          \
+                csp_diag_record(                                       \
+                    (uint32)(frame_sp                                  \
+                             - (frame_sp_old - cell_num_to_copy)),     \
+                    cell_num_to_copy,                                  \
+                    (uint32)(cur_func - module->e->functions),         \
+                    (uint32)(frame_ip - cur_func->u.func->code));      \
+            }                                                          \
             word_copy(frame_sp, frame_sp_old - cell_num_to_copy,       \
                       cell_num_to_copy);                               \
             frame_ref_copy(FRAME_REF(frame_sp),                        \
@@ -1163,6 +1174,54 @@ sign_ext_32_64(int32 val)
     if (val & (int32)0x80000000)
         return (int64)val | (int64)0xffffffff00000000LL;
     return val;
+}
+
+/* ---- DIAG (throwaway, INV2): record anomalous POP_CSP_N overlaps ----
+   The overlapping-stack-copy fix in word_copy below makes a forward-overlapping
+   branch copy SAFE, but the overlap itself means the runtime operand stack sat
+   LOWER relative to the block base than the validator's arity model -- a
+   one-cell divergence that relocates the block result and, when an i64
+   straddles the boundary, reads it word-shifted (small N renders as N<<32:
+   the on-device Flutter counter bug). Record each anomalous copy (dest ahead
+   of src) with the function index + branch-target ip so the diverging opcode
+   can be named from the .wasm. Read via wasm_interp_csp_diag(). */
+typedef struct WASMCspDiagEntry {
+    uint32 shift;    /* dest - src in cells (how far the result relocates) */
+    uint32 num;      /* cells copied */
+    uint32 func_idx; /* index into module->e->functions */
+    uint32 ip_off;   /* branch-target ip offset within the function body */
+} WASMCspDiagEntry;
+static WASMCspDiagEntry g_csp_diag[8];
+static uint32 g_csp_diag_count;
+
+static inline void
+csp_diag_record(uint32 shift, uint32 num, uint32 func_idx, uint32 ip_off)
+{
+    if (g_csp_diag_count < sizeof(g_csp_diag) / sizeof(g_csp_diag[0])) {
+        WASMCspDiagEntry *e = &g_csp_diag[g_csp_diag_count];
+        e->shift = shift;
+        e->num = num;
+        e->func_idx = func_idx;
+        e->ip_off = ip_off;
+    }
+    g_csp_diag_count++;
+}
+
+uint32
+wasm_interp_csp_diag(char *buf, uint32 buf_len)
+{
+    uint32 i, n = g_csp_diag_count;
+    uint32 cap = (uint32)(sizeof(g_csp_diag) / sizeof(g_csp_diag[0]));
+    uint32 stored = n < cap ? n : cap;
+    int off = snprintf(buf, buf_len, "csp_ovl=%u", (unsigned)n);
+    for (i = 0; i < stored && off > 0 && (uint32)off < buf_len; i++) {
+        off += snprintf(buf + off, buf_len - off, " [f%u+%u s%u n%u]",
+                        (unsigned)g_csp_diag[i].func_idx,
+                        (unsigned)g_csp_diag[i].ip_off,
+                        (unsigned)g_csp_diag[i].shift,
+                        (unsigned)g_csp_diag[i].num);
+    }
+    return n;
 }
 
 static inline void
