@@ -5350,6 +5350,15 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     wasm_set_exception(module, "integer divide by zero");
                     goto got_exception;
                 }
+                /* DIAG (throwaway, INV2): same swapped-dividend catch as
+                   I64_DIV_U below -- Dart's ~/ compiles to div_s (the v158
+                   probes only covered the unsigned variants). */
+                if ((uint32)(uint64)a == 0 && (uint32)((uint64)a >> 32) != 0
+                    && (uint32)((uint64)a >> 32) < 4096) {
+                    csp_diag_record(0xd1d3, (uint32)((uint64)a >> 32),
+                                    (uint32)(cur_func - module->e->functions),
+                                    (uint32)(frame_ip - cur_func->u.func->code));
+                }
                 PUSH_I64(a / b);
                 HANDLE_OP_END();
             }
@@ -5394,6 +5403,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 if (b == 0) {
                     wasm_set_exception(module, "integer divide by zero");
                     goto got_exception;
+                }
+                /* DIAG (throwaway, INV2): same swapped-dividend catch --
+                   Dart's % compiles to rem_s. */
+                if ((uint32)(uint64)a == 0 && (uint32)((uint64)a >> 32) != 0
+                    && (uint32)((uint64)a >> 32) < 4096) {
+                    csp_diag_record(0xd1d4, (uint32)((uint64)a >> 32),
+                                    (uint32)(cur_func - module->e->functions),
+                                    (uint32)(frame_ip - cur_func->u.func->code));
                 }
                 PUSH_I64(a % b);
                 HANDLE_OP_END();
