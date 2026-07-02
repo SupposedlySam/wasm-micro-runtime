@@ -61,12 +61,20 @@ _invokeNative:
 
         sub    r5, r5, #4       /* argc -= 4, now we have r0 ~ r3 */
 
-        /* Ensure address is 8 byte aligned */
+        /* Reserve stack for the remaining args, rounded up to 8 bytes so SP
+           stays 8-byte aligned at the call (AAPCS 6.2.1.2). SP is 8-aligned
+           here (5 pushed regs + the sub sp,#4 above = 24 bytes), so the
+           reservation must be a multiple of 8 and nothing more. The removed
+           unconditional `add r6, r6, #4` broke that: any native taking >4
+           packed words was entered with SP%8 == 4, and GCC's outgoing vararg
+           placement vs the callee's va_arg 8-byte alignment then disagreed by
+           4 bytes -- every %lld inside such a native printed value*2^32 (the
+           on-device Flutter counter rendered count*2^32 via the i64ToString
+           embedder native, while the value itself arrived intact in r2:r3). */
         lsl     r6, r5, #2      /* r6 = argc * 4 */
         mov     r7, #7
         add     r6, r6, r7      /* r6 = (r6 + 7) & ~7 */
         bic     r6, r6, r7
-        add     r6, r6, #4      /* +4 because odd(5) registers are in stack */
         mov     r7, sp
         sub     r7, r7, r6      /* reserved stack space for left arguments */
         mov     sp, r7
