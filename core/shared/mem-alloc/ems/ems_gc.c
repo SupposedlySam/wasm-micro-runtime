@@ -14,6 +14,15 @@
 
 #if WASM_ENABLE_GC != 0
 
+/* DIAG (throwaway, INV2): phase-marker hook for the on-device GC crash hunt.
+   Weak no-op so host builds link; the Pebble platform TU provides a strong
+   override that forwards to the BLE console. Remove with the v167 diag. */
+__attribute__((weak)) void
+wamr_pebble_gc_trace(const char *phase)
+{
+    (void)phase;
+}
+
 /* mark node is used for gc marker*/
 typedef struct mark_node_struct {
     /* number of to-expand objects can be saved in this node */
@@ -299,6 +308,7 @@ reclaim_instance_heap(gc_heap_t *heap)
 
     heap->root_set = NULL;
 
+    wamr_pebble_gc_trace("rootset-enum start");
 #if WASM_ENABLE_THREAD_MGR == 0
     if (!heap->exec_env)
         return GC_SUCCESS;
@@ -351,6 +361,7 @@ reclaim_instance_heap(gc_heap_t *heap)
         return GC_ERROR;
     }
 
+    wamr_pebble_gc_trace("mark start");
     /* the algorithm we use to mark all objects */
     /* 1. mark rootset and organize them into a mark_node list (last marked
      * roots at list header, i.e. stack top) */
@@ -431,6 +442,7 @@ reclaim_instance_heap(gc_heap_t *heap)
     }
 
     /* now sweep */
+    wamr_pebble_gc_trace("sweep start");
     sweep_instance_heap(heap);
 
     (void)size;
@@ -461,9 +473,11 @@ gci_gc_heap(void *h)
 
     gct_vm_mutex_lock(&heap->lock);
     heap->is_doing_reclaim = 1;
+    wamr_pebble_gc_trace("gc begin");
 
     ret = reclaim_instance_heap(heap);
 
+    wamr_pebble_gc_trace("gc end");
     heap->is_doing_reclaim = 0;
     gct_vm_mutex_unlock(&heap->lock);
 
