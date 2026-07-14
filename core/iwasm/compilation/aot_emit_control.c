@@ -1857,67 +1857,209 @@ fail:
 #endif /* End of WASM_ENABLE_GC != 0 */
 
 #if WASM_ENABLE_EXCE_HANDLING != 0
-/* M6 task 2: exception-handling opcode codegen. The try scaffold (entry block +
+/* M6 task 2: exception-handling opcode codegen (frame-based unwind; mirrors the
+   interpreter, not LLVM landingpads). The try scaffold (entry block + a
    catch-dispatch block) is emitted by aot_compile_op_block for LABEL_TYPE_TRY;
-   the functions below complete throw/catch/rethrow/delegate. They are being
-   implemented incrementally (route_a/M6_EH_AOT_PLAN.md): an opcode that is not
-   yet codegen'd fails compilation with a NAMED error rather than silently
-   mis-compiling exception control flow. */
+   the functions below emit throw/catch/rethrow/delegate. An in-flight exception
+   is recorded in per-function entry-block storage (see AOTFuncContext.exce_*):
+   the thrown tag index and a byte buffer of its param values, so a catch can
+   read what a throw wrote. Currently the INTRA-function path (throw + catch in
+   the same function) is implemented; cross-function propagation (per-call
+   exception-pending checks + a runtime pending flag) and rethrow/delegate are
+   the next increments (route_a/M6_EH_AOT_PLAN.md) and fail with a NAMED error
+   rather than silently mis-compiling. */
+
+/* Lazily create the entry-block exception storage so it dominates every throw
+   and catch in the function. */
+static bool
+aot_ensure_exce_storage(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
+{
+    WASMModule *module = comp_ctx->comp_data->wasm_module;
+    LLVMBuilderRef builder = comp_ctx->builder;
+    LLVMBasicBlockRef cur_block, entry_block;
+    LLVMValueRef first_instr;
+    uint32 i, j, sz, max_size = 0;
+    uint32 tag_total = module->import_tag_count + module->tag_count;
+
+    if (func_ctx->exce_tag_alloca)
+        return true;
+
+    for (i = 0; i < tag_total; i++) {
+        WASMFuncType *tt = module->tags[i]->tag_type;
+        sz = 0;
+        for (j = 0; j < tt->param_count; j++)
+            sz += wasm_value_type_size_internal(
+                tt->types[j], (uint8)comp_ctx->pointer_size);
+        if (sz > max_size)
+            max_size = sz;
+    }
+    if (max_size == 0)
+        max_size = 4;
+    func_ctx->exce_values_size = max_size;
+
+    cur_block = LLVMGetInsertBlock(builder);
+    entry_block = LLVMGetEntryBasicBlock(func_ctx->func);
+    first_instr = LLVMGetFirstInstruction(entry_block);
+    if (first_instr)
+        LLVMPositionBuilderBefore(builder, first_instr);
+    else
+        LLVMPositionBuilderAtEnd(builder, entry_block);
+
+    func_ctx->exce_tag_alloca = LLVMBuildAlloca(builder, I32_TYPE, "exce_tag");
+    func_ctx->exce_values_alloca =
+        LLVMBuildArrayAlloca(builder, INT8_TYPE, I32_CONST(max_size),
+                             "exce_values");
+    LLVMPositionBuilderAtEnd(builder, cur_block);
+
+    if (!func_ctx->exce_tag_alloca || !func_ctx->exce_values_alloca) {
+        aot_set_last_error("llvm build alloca failed for exception storage.");
+        return false;
+    }
+    return true;
+}
+
+/* Store `value` (of wasm type value_type) at byte `offset` in the exception
+   values buffer. */
+static bool
+aot_store_exce_value(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                     uint32 offset, LLVMValueRef value, uint8 value_type)
+{
+    LLVMValueRef idx = I32_CONST(offset), ptr, tptr;
+    LLVMTypeRef llvm_type = TO_LLVM_TYPE(value_type);
+
+    if (!(ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                      func_ctx->exce_values_alloca, &idx, 1,
+                                      "exce_val_ptr"))
+        || !(tptr = LLVMBuildBitCast(comp_ctx->builder, ptr,
+                                     LLVMPointerType(llvm_type, 0),
+                                     "exce_val_tptr"))
+        || !LLVMBuildStore(comp_ctx->builder, value, tptr)) {
+        aot_set_last_error("llvm build store exception value failed.");
+        return false;
+    }
+    return true;
+}
+
 bool
 aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
-                     uint8 **p_frame_ip, uint8 *frame_ip_end)
+                     uint32 tag_index, uint8 **p_frame_ip)
 {
-    (void)comp_ctx;
-    (void)func_ctx;
-    (void)p_frame_ip;
-    (void)frame_ip_end;
-    aot_set_last_error("aot: WASM_OP_THROW codegen not yet implemented (M6 task 2)");
-    return false;
+    WASMModule *module = comp_ctx->comp_data->wasm_module;
+    WASMFuncType *tag_type;
+    AOTBlock *try_block;
+    LLVMBasicBlockRef target;
+    LLVMValueRef value, tag_val;
+    uint32 *offsets = NULL;
+    uint32 i, off = 0, param_count;
+    uint8 param_type;
+    bool ret = false;
+
+    if (tag_index >= module->import_tag_count + module->tag_count) {
+        aot_set_last_error("invalid tag index in throw.");
+        return false;
+    }
+    tag_type = module->tags[tag_index]->tag_type;
+    param_count = tag_type->param_count;
+
+    if (!aot_ensure_exce_storage(comp_ctx, func_ctx))
+        return false;
+
+    if (param_count > 0) {
+        if (!(offsets = wasm_runtime_malloc((uint32)sizeof(uint32) * param_count))) {
+            aot_set_last_error("allocate memory failed.");
+            return false;
+        }
+        for (i = 0; i < param_count; i++) {
+            offsets[i] = off;
+            off += wasm_value_type_size_internal(tag_type->types[i],
+                                                 (uint8)comp_ctx->pointer_size);
+        }
+        /* the last param is on top of the stack; pop in reverse */
+        for (i = param_count; i > 0; i--) {
+            param_type = tag_type->types[i - 1];
+            POP(value, param_type);
+            if (!aot_store_exce_value(comp_ctx, func_ctx, offsets[i - 1], value,
+                                      param_type))
+                goto fail;
+        }
+    }
+
+    tag_val = I32_CONST(tag_index);
+    if (!LLVMBuildStore(comp_ctx->builder, tag_val, func_ctx->exce_tag_alloca)) {
+        aot_set_last_error("llvm build store failed.");
+        goto fail;
+    }
+
+    /* Branch to the innermost enclosing try's catch dispatch. If there is no
+       enclosing try in this function the exception is uncaught here: for now go
+       to the function's got_exception epilogue (cross-function propagation via a
+       runtime pending flag + per-call checks is the next increment). */
+    try_block = func_ctx->block_stack.block_list_end;
+    while (try_block && try_block->label_type != LABEL_TYPE_TRY)
+        try_block = try_block->prev;
+    target = try_block ? try_block->llvm_catch_dispatch_block
+                       : func_ctx->got_exception_block;
+    BUILD_BR(target);
+
+    if (try_block) {
+        /* Control resumes at this try's catch(es); the main loop reaches the
+           CATCH opcode next (it repositions the builder to the catch-dispatch).
+           The current post-throw block is dead and left terminated. (NOTE: any
+           dead code physically between the throw and the first catch is not yet
+           skipped -- see M6_EH_AOT_PLAN.md; fine for a throw immediately before
+           its catch.) */
+        ret = true;
+    }
+    else {
+        /* Uncaught in this function: like a return, skip the dead code after. */
+        ret = aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
+    }
+fail:
+    if (offsets)
+        wasm_runtime_free(offsets);
+    return ret;
 }
 
 bool
 aot_compile_op_rethrow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
-                       uint8 **p_frame_ip, uint8 *frame_ip_end)
+                       uint32 relative_depth, uint8 **p_frame_ip)
 {
     (void)comp_ctx;
     (void)func_ctx;
+    (void)relative_depth;
     (void)p_frame_ip;
-    (void)frame_ip_end;
     aot_set_last_error("aot: WASM_OP_RETHROW codegen not yet implemented (M6 task 2)");
     return false;
 }
 
 bool
 aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
-                     uint8 **p_frame_ip, uint8 *frame_ip_end)
+                     uint32 tag_index)
 {
     (void)comp_ctx;
     (void)func_ctx;
-    (void)p_frame_ip;
-    (void)frame_ip_end;
+    (void)tag_index;
     aot_set_last_error("aot: WASM_OP_CATCH codegen not yet implemented (M6 task 2)");
     return false;
 }
 
 bool
-aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
-                         uint8 **p_frame_ip)
+aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
 {
     (void)comp_ctx;
     (void)func_ctx;
-    (void)p_frame_ip;
     aot_set_last_error("aot: WASM_OP_CATCH_ALL codegen not yet implemented (M6 task 2)");
     return false;
 }
 
 bool
 aot_compile_op_delegate(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
-                        uint8 **p_frame_ip, uint8 *frame_ip_end)
+                        uint32 relative_depth, uint8 **p_frame_ip)
 {
     (void)comp_ctx;
     (void)func_ctx;
+    (void)relative_depth;
     (void)p_frame_ip;
-    (void)frame_ip_end;
     aot_set_last_error("aot: WASM_OP_DELEGATE codegen not yet implemented (M6 task 2)");
     return false;
 }

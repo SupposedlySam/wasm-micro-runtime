@@ -1157,33 +1157,48 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
 
 #if WASM_ENABLE_EXCE_HANDLING != 0
             case WASM_OP_THROW:
-                if (!aot_compile_op_throw(comp_ctx, func_ctx, &frame_ip,
-                                          frame_ip_end))
+            {
+                uint32 tag_index = 0;
+                read_leb_uint32(frame_ip, frame_ip_end, tag_index);
+                if (!aot_compile_op_throw(comp_ctx, func_ctx, tag_index,
+                                          &frame_ip))
                     return false;
                 break;
+            }
 
             case WASM_OP_RETHROW:
-                if (!aot_compile_op_rethrow(comp_ctx, func_ctx, &frame_ip,
-                                            frame_ip_end))
+            {
+                uint32 relative_depth = 0;
+                read_leb_uint32(frame_ip, frame_ip_end, relative_depth);
+                if (!aot_compile_op_rethrow(comp_ctx, func_ctx, relative_depth,
+                                            &frame_ip))
                     return false;
                 break;
+            }
 
             case WASM_OP_CATCH:
-                if (!aot_compile_op_catch(comp_ctx, func_ctx, &frame_ip,
-                                          frame_ip_end))
+            {
+                uint32 tag_index = 0;
+                read_leb_uint32(frame_ip, frame_ip_end, tag_index);
+                if (!aot_compile_op_catch(comp_ctx, func_ctx, tag_index))
                     return false;
                 break;
+            }
 
             case WASM_OP_CATCH_ALL:
-                if (!aot_compile_op_catch_all(comp_ctx, func_ctx, &frame_ip))
+                if (!aot_compile_op_catch_all(comp_ctx, func_ctx))
                     return false;
                 break;
 
             case WASM_OP_DELEGATE:
-                if (!aot_compile_op_delegate(comp_ctx, func_ctx, &frame_ip,
-                                             frame_ip_end))
+            {
+                uint32 relative_depth = 0;
+                read_leb_uint32(frame_ip, frame_ip_end, relative_depth);
+                if (!aot_compile_op_delegate(comp_ctx, func_ctx, relative_depth,
+                                             &frame_ip))
                     return false;
                 break;
+            }
 #endif /* WASM_ENABLE_EXCE_HANDLING */
 
             case WASM_OP_BR:

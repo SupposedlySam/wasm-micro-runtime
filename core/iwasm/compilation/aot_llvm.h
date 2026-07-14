@@ -282,6 +282,16 @@ typedef struct AOTFuncContext {
     /* current ip when exception is thrown */
     LLVMValueRef exception_ip_phi;
     LLVMValueRef func_type_indexes;
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    /* Lazily-created entry-block storage for the in-flight wasm exception, so a
+       `catch` can read what a `throw` recorded. exce_tag_alloca holds the thrown
+       tag index (i32, -1 == none); exce_values_alloca is a byte buffer holding
+       the tag's param values (sized to the widest tag in the module). Created in
+       the entry block so they dominate every throw and catch site. */
+    LLVMValueRef exce_tag_alloca;
+    LLVMValueRef exce_values_alloca;
+    uint32 exce_values_size;
+#endif
 #if WASM_ENABLE_DEBUG_AOT != 0
     LLVMMetadataRef debug_func;
 #endif
