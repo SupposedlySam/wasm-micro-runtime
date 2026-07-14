@@ -300,11 +300,19 @@ get_init_expr_size(const AOTCompContext *comp_ctx, const AOTCompData *comp_data,
                     ? array_new_init_values->length
                     : 1;
 
-            /* array_elem_type + type_index + len + elems */
-            size += sizeof(uint32) * 3
-                    + (uint64)wasm_value_type_size_internal(
-                          array_type->elem_type, comp_ctx->pointer_size)
-                          * value_count;
+            /* array_elem_type + type_index + len + elems. Each element is
+               emitted as a 4/8/16-byte slot (aot_emit_init_expr: field_size<=4
+               -> EMIT_U32), so a packed elem_type (i8/i16, size 1/2) still
+               occupies 4 bytes. Floor to sizeof(uint32) to match the emitter --
+               mirrors the STRUCT_NEW field sizing above. Without this, packed
+               arrays in const globals undercount and "emit global info failed". */
+            {
+                uint32 elem_size = wasm_value_type_size_internal(
+                    array_type->elem_type, comp_ctx->pointer_size);
+                if (elem_size < sizeof(uint32))
+                    elem_size = sizeof(uint32);
+                size += sizeof(uint32) * 3 + (uint64)elem_size * value_count;
+            }
             break;
         }
 #endif /* end of WASM_ENABLE_GC != 0 */
