@@ -63,7 +63,7 @@ endfunction()
 # and tests/wamr-test-suites/test_wamr.sh
 
 if(WAMR_BUILD_EXCE_HANDLING EQUAL 1)
-  check_aot_mode_error("Unsupported build configuration: EXCE_HANDLING + AOT")
+  # M6: EXCE_HANDLING+AOT enabled -- EH-in-AOT codegen under implementation (route_a/M6_EH_AOT_PLAN.md)
   check_fast_interp_error("Unsupported build configuration: EXCE_HANDLING + FAST_INTERP")
   check_fast_jit_error("Unsupported build configuration: EXCE_HANDLING + FAST_JIT")
   check_llvm_jit_error("Unsupported build configuration: EXCE_HANDLING + JIT")
