@@ -343,6 +343,36 @@ handle_next_reachable_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
     while (block && !block->is_reachable) {
+#if WASM_ENABLE_EXCE_HANDLING != 0
+        if (block->label_type == LABEL_TYPE_TRY) {
+            /* Unwinding dead code inside a try -- after a throw in the body, or
+               a catch handler that ended in a br/return/throw. The try's catch
+               clauses live inline in the byte stream and must still be compiled,
+               so do NOT pop the try here: scan to the next catch/catch_all/
+               delegate/end at this try's depth and resume parsing there. The
+               current (dead) block stays terminated; aot_compile_op_catch and
+               aot_compile_op_end skip their fall-through when the builder sits on
+               an already-terminated block. The try is torn down and finalized by
+               its own op_end. Use the local frame_ip (advanced past any inner
+               blocks already popped this unwind) as the scan origin. */
+            BlockAddr blk_cache[BLOCK_ADDR_CACHE_SIZE][BLOCK_ADDR_CONFLICT_SIZE];
+            uint8 *scan_start = frame_ip ? frame_ip + 1 : *p_frame_ip;
+            uint8 *code_end =
+                func_ctx->aot_func->code + func_ctx->aot_func->code_size;
+            uint8 *else_a = NULL, *catch_or_end = NULL;
+            memset(blk_cache, 0, sizeof(blk_cache));
+            if (!wasm_loader_find_block_addr(NULL, (BlockAddr *)blk_cache,
+                                             scan_start, code_end,
+                                             (uint8)LABEL_TYPE_TRY, &else_a,
+                                             &catch_or_end)) {
+                aot_set_last_error("find try catch/end addr failed.");
+                return false;
+            }
+            aot_value_stack_destroy(comp_ctx, &block->value_stack);
+            *p_frame_ip = catch_or_end;
+            return true;
+        }
+#endif
         block_prev = block->prev;
         block = aot_block_stack_pop(&func_ctx->block_stack);
 
@@ -372,35 +402,6 @@ handle_next_reachable_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                 block->llvm_end_block = NULL;
             }
         }
-
-#if WASM_ENABLE_EXCE_HANDLING != 0
-        if (block->label_type == LABEL_TYPE_TRY && block->llvm_catch_next_block
-            && !LLVMGetBasicBlockTerminator(block->llvm_catch_next_block)) {
-            /* Finalize the try's last catch mismatch edge (see op_end): an
-               uncaught exception re-propagates to the enclosing try or the
-               function's got_exception epilogue. Needed here too because a
-               return/br in a handler pops the try via this path (not op_end). */
-            LLVMBasicBlockRef save = LLVMGetInsertBlock(comp_ctx->builder);
-            AOTBlock *outer = block_prev;
-            bool ok;
-            while (outer && outer->label_type != LABEL_TYPE_TRY)
-                outer = outer->prev;
-            SET_BUILDER_POS(block->llvm_catch_next_block);
-            /* enclosing try -> its dispatch; otherwise the exception is uncaught
-               in this function -- TODO(M6) cross-function propagate via a runtime
-               pending flag; for now (intra-function EH) it is unreachable. */
-            ok = outer ? (LLVMBuildBr(comp_ctx->builder,
-                                      outer->llvm_catch_dispatch_block)
-                          != NULL)
-                       : (LLVMBuildUnreachable(comp_ctx->builder) != NULL);
-            if (!ok) {
-                aot_set_last_error("llvm build terminator failed.");
-                return false;
-            }
-            if (save)
-                SET_BUILDER_POS(save);
-        }
-#endif
 
         frame_ip = block->wasm_code_end;
         aot_block_destroy(comp_ctx, block);
@@ -974,7 +975,22 @@ aot_compile_op_end(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             MOVE_BLOCK_BEFORE(block->llvm_end_block, next_llvm_end_block);
     }
 
-    if (comp_ctx->aot_frame) {
+    /* For a try, the byte stream reaches this END with the builder sitting on an
+       already-terminated block when the try body / last catch handler ended in a
+       throw/rethrow/br/return rather than falling through (the unwinder resumes
+       parsing at the catches/end without repositioning the builder). Nothing more
+       may be emitted into that dead block -- not the frame commit, the result
+       pop, nor a fall-through branch. The try's live result already reached
+       llvm_end_block via aot_compile_op_catch. */
+    bool cur_live = true;
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    if (block->label_type == LABEL_TYPE_TRY) {
+        LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(comp_ctx->builder);
+        cur_live = !(cur_bb && LLVMGetBasicBlockTerminator(cur_bb));
+    }
+#endif
+
+    if (comp_ctx->aot_frame && cur_live) {
         if (block->label_type != LABEL_TYPE_FUNCTION && comp_ctx->enable_gc
             && !aot_gen_commit_values(comp_ctx->aot_frame)) {
             return false;
@@ -983,20 +999,22 @@ aot_compile_op_end(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
     /* Handle block result values */
     CREATE_RESULT_VALUE_PHIS(block);
-    for (i = 0; i < block->result_count; i++) {
-        value = NULL;
-        result_index = block->result_count - 1 - i;
-        POP(value, block->result_types[result_index]);
-        bh_assert(value);
-        ADD_TO_RESULT_PHIS(block, value, result_index);
-    }
+    if (cur_live) {
+        for (i = 0; i < block->result_count; i++) {
+            value = NULL;
+            result_index = block->result_count - 1 - i;
+            POP(value, block->result_types[result_index]);
+            bh_assert(value);
+            ADD_TO_RESULT_PHIS(block, value, result_index);
+        }
 
-    if (comp_ctx->aot_frame) {
-        bh_assert(comp_ctx->aot_frame->sp == block->frame_sp_begin);
-    }
+        if (comp_ctx->aot_frame) {
+            bh_assert(comp_ctx->aot_frame->sp == block->frame_sp_begin);
+        }
 
-    /* Jump to the end block */
-    BUILD_BR(block->llvm_end_block);
+        /* Jump to the end block */
+        BUILD_BR(block->llvm_end_block);
+    }
 
     block->is_reachable = true;
     return handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
@@ -2054,14 +2072,13 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         try_block = try_block->prev;
 
     if (try_block) {
-        /* Branch to this try's catch dispatch. Control resumes at the CATCH
-           opcode, which the main loop reaches next (it repositions the builder
-           to the catch-dispatch). The current post-throw block is dead and left
-           terminated. (NOTE: dead code physically between the throw and the
-           first catch is not yet skipped -- see M6_EH_AOT_PLAN.md; fine for a
-           throw immediately before its catch.) */
+        /* Branch to this try's catch dispatch. The post-throw block is now
+           terminated and dead; skip forward like a br so any dead code between
+           the throw and the try's first catch is not emitted into it.
+           handle_next_reachable_block stops at the enclosing try (see its
+           LABEL_TYPE_TRY case) and resumes parsing at the first catch. */
         BUILD_BR(try_block->llvm_catch_dispatch_block);
-        ret = true;
+        ret = aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
     }
     else {
         /* Uncaught in this function -- TODO(M6): propagate to the caller via a
@@ -2083,11 +2100,36 @@ bool
 aot_compile_op_rethrow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                        uint32 relative_depth, uint8 **p_frame_ip)
 {
-    (void)comp_ctx;
-    (void)func_ctx;
-    (void)relative_depth;
-    (void)p_frame_ip;
-    aot_set_last_error("aot: WASM_OP_RETHROW codegen not yet implemented (M6 task 2)");
+    /* Re-throw the in-flight exception (its tag+values are still in the exce
+       storage) to the handlers enclosing the try at relative_depth. In this
+       model a catch handler runs with its TRY block on the stack, so count TRY
+       blocks: relative_depth 0 is the innermost. Re-propagate to that try's
+       enclosing try dispatch, or unreachable if uncaught (cross-function TODO). */
+    AOTBlock *block = func_ctx->block_stack.block_list_end;
+    AOTBlock *target = NULL, *outer;
+    uint32 d = relative_depth;
+
+    for (; block; block = block->prev) {
+        if (block->label_type == LABEL_TYPE_TRY) {
+            if (d == 0) {
+                target = block;
+                break;
+            }
+            d--;
+        }
+    }
+    outer = target ? target->prev : NULL;
+    while (outer && outer->label_type != LABEL_TYPE_TRY)
+        outer = outer->prev;
+    if (outer) {
+        BUILD_BR(outer->llvm_catch_dispatch_block);
+    }
+    else if (!LLVMBuildUnreachable(comp_ctx->builder)) {
+        aot_set_last_error("llvm build unreachable failed.");
+        return false;
+    }
+    return aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
+fail:
     return false;
 }
 
@@ -2113,6 +2155,14 @@ aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         return false;
     }
     tag_type = module->tags[tag_index]->tag_type;
+
+    /* Ensure the exception storage exists: a function may CATCH without itself
+       THROWing (the exception was thrown in a callee), so the storage was not
+       created by a throw here. (NOTE: cross-function reads of a per-function
+       alloca are not yet correct -- that needs the runtime exception state; this
+       just avoids a NULL deref so the module compiles. See M6_EH_AOT_PLAN.md.) */
+    if (!aot_ensure_exce_storage(comp_ctx, func_ctx))
+        return false;
 
     /* The preceding section (try body or previous catch handler) falls through
        to the try end when its block is still live; if it ended in a branch/
@@ -2183,9 +2233,49 @@ fail:
 bool
 aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
 {
-    (void)comp_ctx;
-    (void)func_ctx;
-    aot_set_last_error("aot: WASM_OP_CATCH_ALL codegen not yet implemented (M6 task 2)");
+    AOTBlock *try_block = func_ctx->block_stack.block_list_end;
+    LLVMBasicBlockRef cur_block, handler_block;
+    LLVMValueRef value;
+    uint32 i;
+    char name[32];
+
+    if (!try_block || try_block->label_type != LABEL_TYPE_TRY) {
+        aot_set_last_error("catch_all not directly in a try block.");
+        return false;
+    }
+    if (!aot_ensure_exce_storage(comp_ctx, func_ctx))
+        return false;
+
+    /* Preceding section (try body or a prior catch handler) falls through to the
+       try end if its block is still live. */
+    cur_block = LLVMGetInsertBlock(comp_ctx->builder);
+    if (cur_block && !LLVMGetBasicBlockTerminator(cur_block)) {
+        if (!try_block->llvm_end_block) {
+            format_block_name(name, sizeof(name), try_block->block_index,
+                              try_block->label_type, LABEL_END);
+            CREATE_BLOCK(try_block->llvm_end_block, name);
+        }
+        CREATE_RESULT_VALUE_PHIS(try_block);
+        for (i = 0; i < try_block->result_count; i++) {
+            uint32 ri = try_block->result_count - 1 - i;
+            POP(value, try_block->result_types[ri]);
+            ADD_TO_RESULT_PHIS(try_block, value, ri);
+        }
+        BUILD_BR(try_block->llvm_end_block);
+    }
+
+    /* catch_all matches any exception: unconditional branch to the handler. It
+       exposes no params. Since it catches everything, there is no mismatch edge
+       to re-propagate -- clear catch_next so finalization skips it. */
+    SET_BUILDER_POS(try_block->llvm_catch_next_block);
+    CREATE_BLOCK(handler_block, "catch_all_handler");
+    BUILD_BR(handler_block);
+    try_block->llvm_catch_next_block = NULL;
+
+    aot_value_stack_destroy(comp_ctx, &try_block->value_stack);
+    SET_BUILDER_POS(handler_block);
+    return true;
+fail:
     return false;
 }
 
