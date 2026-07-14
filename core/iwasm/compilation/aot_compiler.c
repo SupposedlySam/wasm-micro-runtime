@@ -1127,6 +1127,12 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
             case EXT_OP_BLOCK:
             case EXT_OP_LOOP:
             case EXT_OP_IF:
+#if WASM_ENABLE_EXCE_HANDLING != 0
+            /* typed try: EXT_OP_TRY(0xdb) - EXT_OP_BLOCK(0xd7) == 4, so the
+               label_type below computes to LABEL_TYPE_TRY. dart2wasm emits these
+               (multi-value/typed trys) rather than the inline-blocktype WASM_OP_TRY. */
+            case EXT_OP_TRY:
+#endif
             {
                 read_leb_int32(frame_ip, frame_ip_end, type_index);
                 /* type index was checked in wasm loader */
@@ -3984,8 +3990,12 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
 #endif /* end of WASM_ENABLE_SIMD */
 
             default:
-                aot_set_last_error("unsupported opcode");
+            {
+                char err[48];
+                snprintf(err, sizeof(err), "unsupported opcode 0x%02x", opcode);
+                aot_set_last_error(err);
                 return false;
+            }
         }
     }
 
