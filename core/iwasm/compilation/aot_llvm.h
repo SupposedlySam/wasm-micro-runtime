@@ -194,6 +194,19 @@ typedef struct AOTBlock {
     /* The max frame stack pointer that br/br_if/br_table/br_on_xxx
        opcodes ever reached when they jumped to the end this block */
     AOTValueSlot *frame_sp_max_reached;
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    /* For a LABEL_TYPE_TRY block: the basic block that a `throw` (or a pending
+       exception surfacing after a call) inside this try branches to. Each
+       `catch`/`catch_all` emits a tag test here, chaining to the next handler;
+       an unmatched exception re-propagates to the next-outer try (or the
+       function epilogue). Built structurally while walking try/catch/end. */
+    LLVMBasicBlockRef llvm_catch_dispatch_block;
+    /* Insertion point for the NEXT catch's tag test (advances per catch). */
+    LLVMBasicBlockRef llvm_catch_next_block;
+    /* The tag index this try's currently-open catch matches (or -1). */
+    int32 cur_catch_tag_index;
+#endif
 } AOTBlock;
 
 /**
