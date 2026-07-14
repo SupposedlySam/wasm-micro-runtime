@@ -661,12 +661,27 @@ aot_compile_op_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         }
     }
 
-    if (label_type == LABEL_TYPE_BLOCK || label_type == LABEL_TYPE_LOOP) {
+    if (label_type == LABEL_TYPE_BLOCK || label_type == LABEL_TYPE_LOOP
+#if WASM_ENABLE_EXCE_HANDLING != 0
+        || label_type == LABEL_TYPE_TRY
+#endif
+    ) {
         /* Create block */
         format_block_name(name, sizeof(name), block->block_index, label_type,
                           LABEL_BEGIN);
         CREATE_BLOCK(block->llvm_entry_block, name);
         MOVE_BLOCK_AFTER_CURR(block->llvm_entry_block);
+#if WASM_ENABLE_EXCE_HANDLING != 0
+        if (label_type == LABEL_TYPE_TRY) {
+            /* A `throw` (or a pending exception surfacing after a call) inside
+               this try branches here; catch/catch_all populate it with the tag
+               tests + handler bodies while walking the stream. Created up front
+               so throw sites can target it before the catches are emitted. */
+            CREATE_BLOCK(block->llvm_catch_dispatch_block, "try_catch_dispatch");
+            block->llvm_catch_next_block = block->llvm_catch_dispatch_block;
+            block->cur_catch_tag_index = -1;
+        }
+#endif
         /* Jump to the entry block */
         BUILD_BR(block->llvm_entry_block);
         if (!push_aot_block_to_stack_and_pass_params(comp_ctx, func_ctx, block))
@@ -1840,3 +1855,70 @@ fail:
 }
 
 #endif /* End of WASM_ENABLE_GC != 0 */
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+/* M6 task 2: exception-handling opcode codegen. The try scaffold (entry block +
+   catch-dispatch block) is emitted by aot_compile_op_block for LABEL_TYPE_TRY;
+   the functions below complete throw/catch/rethrow/delegate. They are being
+   implemented incrementally (route_a/M6_EH_AOT_PLAN.md): an opcode that is not
+   yet codegen'd fails compilation with a NAMED error rather than silently
+   mis-compiling exception control flow. */
+bool
+aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                     uint8 **p_frame_ip, uint8 *frame_ip_end)
+{
+    (void)comp_ctx;
+    (void)func_ctx;
+    (void)p_frame_ip;
+    (void)frame_ip_end;
+    aot_set_last_error("aot: WASM_OP_THROW codegen not yet implemented (M6 task 2)");
+    return false;
+}
+
+bool
+aot_compile_op_rethrow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                       uint8 **p_frame_ip, uint8 *frame_ip_end)
+{
+    (void)comp_ctx;
+    (void)func_ctx;
+    (void)p_frame_ip;
+    (void)frame_ip_end;
+    aot_set_last_error("aot: WASM_OP_RETHROW codegen not yet implemented (M6 task 2)");
+    return false;
+}
+
+bool
+aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                     uint8 **p_frame_ip, uint8 *frame_ip_end)
+{
+    (void)comp_ctx;
+    (void)func_ctx;
+    (void)p_frame_ip;
+    (void)frame_ip_end;
+    aot_set_last_error("aot: WASM_OP_CATCH codegen not yet implemented (M6 task 2)");
+    return false;
+}
+
+bool
+aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                         uint8 **p_frame_ip)
+{
+    (void)comp_ctx;
+    (void)func_ctx;
+    (void)p_frame_ip;
+    aot_set_last_error("aot: WASM_OP_CATCH_ALL codegen not yet implemented (M6 task 2)");
+    return false;
+}
+
+bool
+aot_compile_op_delegate(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                        uint8 **p_frame_ip, uint8 *frame_ip_end)
+{
+    (void)comp_ctx;
+    (void)func_ctx;
+    (void)p_frame_ip;
+    (void)frame_ip_end;
+    aot_set_last_error("aot: WASM_OP_DELEGATE codegen not yet implemented (M6 task 2)");
+    return false;
+}
+#endif /* WASM_ENABLE_EXCE_HANDLING != 0 */

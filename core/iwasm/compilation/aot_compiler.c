@@ -1071,6 +1071,13 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
             case WASM_OP_BLOCK:
             case WASM_OP_LOOP:
             case WASM_OP_IF:
+#if WASM_ENABLE_EXCE_HANDLING != 0
+            /* TRY has a blocktype immediate like BLOCK; its label_type computes
+               to LABEL_TYPE_TRY (LABEL_TYPE_BLOCK + WASM_OP_TRY - WASM_OP_BLOCK
+               == 0 + 4). aot_compile_op_block sets up the try body + its
+               catch-dispatch block; catch/throw/end complete the control flow. */
+            case WASM_OP_TRY:
+#endif
             {
                 value_type = *frame_ip++;
                 if (value_type == VALUE_TYPE_I32 || value_type == VALUE_TYPE_I64
@@ -1147,6 +1154,37 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
                 if (!aot_compile_op_end(comp_ctx, func_ctx, &frame_ip))
                     return false;
                 break;
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+            case WASM_OP_THROW:
+                if (!aot_compile_op_throw(comp_ctx, func_ctx, &frame_ip,
+                                          frame_ip_end))
+                    return false;
+                break;
+
+            case WASM_OP_RETHROW:
+                if (!aot_compile_op_rethrow(comp_ctx, func_ctx, &frame_ip,
+                                            frame_ip_end))
+                    return false;
+                break;
+
+            case WASM_OP_CATCH:
+                if (!aot_compile_op_catch(comp_ctx, func_ctx, &frame_ip,
+                                          frame_ip_end))
+                    return false;
+                break;
+
+            case WASM_OP_CATCH_ALL:
+                if (!aot_compile_op_catch_all(comp_ctx, func_ctx, &frame_ip))
+                    return false;
+                break;
+
+            case WASM_OP_DELEGATE:
+                if (!aot_compile_op_delegate(comp_ctx, func_ctx, &frame_ip,
+                                             frame_ip_end))
+                    return false;
+                break;
+#endif /* WASM_ENABLE_EXCE_HANDLING */
 
             case WASM_OP_BR:
             {

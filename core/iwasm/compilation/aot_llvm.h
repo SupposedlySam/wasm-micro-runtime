@@ -215,8 +215,10 @@ typedef struct AOTBlock {
 typedef struct AOTBlockStack {
     AOTBlock *block_list_head;
     AOTBlock *block_list_end;
-    /* Current block index of each block type */
-    uint32 block_index[3];
+    /* Current block index of each block type. Sized to cover the EH label
+       types too (LABEL_TYPE_TRY=4 / CATCH=5 / CATCH_ALL=6) so a try block routed
+       through aot_compile_op_block doesn't index past the array. */
+    uint32 block_index[7];
 } AOTBlockStack;
 
 typedef struct AOTCheckedAddr {

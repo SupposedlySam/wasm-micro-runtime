@@ -71,6 +71,28 @@ aot_compile_op_br_on_cast(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                           uint32 br_depth, uint8 **p_frame_ip);
 #endif
 
+#if WASM_ENABLE_EXCE_HANDLING != 0
+bool
+aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                     uint8 **p_frame_ip, uint8 *frame_ip_end);
+
+bool
+aot_compile_op_rethrow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                       uint8 **p_frame_ip, uint8 *frame_ip_end);
+
+bool
+aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                     uint8 **p_frame_ip, uint8 *frame_ip_end);
+
+bool
+aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                         uint8 **p_frame_ip);
+
+bool
+aot_compile_op_delegate(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                        uint8 **p_frame_ip, uint8 *frame_ip_end);
+#endif /* WASM_ENABLE_EXCE_HANDLING != 0 */
+
 #ifdef __cplusplus
 } /* end of extern "C" */
 #endif
