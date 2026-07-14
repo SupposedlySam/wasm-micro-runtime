@@ -373,6 +373,35 @@ handle_next_reachable_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             }
         }
 
+#if WASM_ENABLE_EXCE_HANDLING != 0
+        if (block->label_type == LABEL_TYPE_TRY && block->llvm_catch_next_block
+            && !LLVMGetBasicBlockTerminator(block->llvm_catch_next_block)) {
+            /* Finalize the try's last catch mismatch edge (see op_end): an
+               uncaught exception re-propagates to the enclosing try or the
+               function's got_exception epilogue. Needed here too because a
+               return/br in a handler pops the try via this path (not op_end). */
+            LLVMBasicBlockRef save = LLVMGetInsertBlock(comp_ctx->builder);
+            AOTBlock *outer = block_prev;
+            bool ok;
+            while (outer && outer->label_type != LABEL_TYPE_TRY)
+                outer = outer->prev;
+            SET_BUILDER_POS(block->llvm_catch_next_block);
+            /* enclosing try -> its dispatch; otherwise the exception is uncaught
+               in this function -- TODO(M6) cross-function propagate via a runtime
+               pending flag; for now (intra-function EH) it is unreachable. */
+            ok = outer ? (LLVMBuildBr(comp_ctx->builder,
+                                      outer->llvm_catch_dispatch_block)
+                          != NULL)
+                       : (LLVMBuildUnreachable(comp_ctx->builder) != NULL);
+            if (!ok) {
+                aot_set_last_error("llvm build terminator failed.");
+                return false;
+            }
+            if (save)
+                SET_BUILDER_POS(save);
+        }
+#endif
+
         frame_ip = block->wasm_code_end;
         aot_block_destroy(comp_ctx, block);
         block = block_prev;
@@ -909,6 +938,32 @@ aot_compile_op_end(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         aot_set_last_error("WASM block stack underflow.");
         return false;
     }
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    if (block->label_type == LABEL_TYPE_TRY && block->llvm_catch_next_block
+        && !LLVMGetBasicBlockTerminator(block->llvm_catch_next_block)) {
+        /* The last catch's mismatch edge: an exception not caught by this try
+           re-propagates to the enclosing try's catch-dispatch, or the function's
+           got_exception epilogue if there is no enclosing try. */
+        LLVMBasicBlockRef save = LLVMGetInsertBlock(comp_ctx->builder);
+        AOTBlock *outer = block->prev;
+        bool ok;
+        while (outer && outer->label_type != LABEL_TYPE_TRY)
+            outer = outer->prev;
+        SET_BUILDER_POS(block->llvm_catch_next_block);
+        ok = outer
+                 ? (LLVMBuildBr(comp_ctx->builder,
+                                outer->llvm_catch_dispatch_block)
+                    != NULL)
+                 : (LLVMBuildUnreachable(comp_ctx->builder) != NULL);
+        if (!ok) {
+            aot_set_last_error("llvm build terminator failed.");
+            return false;
+        }
+        if (save)
+            SET_BUILDER_POS(save);
+    }
+#endif
 
     /* Create the end block */
     if (!block->llvm_end_block) {
@@ -1997,21 +2052,25 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     try_block = func_ctx->block_stack.block_list_end;
     while (try_block && try_block->label_type != LABEL_TYPE_TRY)
         try_block = try_block->prev;
-    target = try_block ? try_block->llvm_catch_dispatch_block
-                       : func_ctx->got_exception_block;
-    BUILD_BR(target);
 
     if (try_block) {
-        /* Control resumes at this try's catch(es); the main loop reaches the
-           CATCH opcode next (it repositions the builder to the catch-dispatch).
-           The current post-throw block is dead and left terminated. (NOTE: any
-           dead code physically between the throw and the first catch is not yet
-           skipped -- see M6_EH_AOT_PLAN.md; fine for a throw immediately before
-           its catch.) */
+        /* Branch to this try's catch dispatch. Control resumes at the CATCH
+           opcode, which the main loop reaches next (it repositions the builder
+           to the catch-dispatch). The current post-throw block is dead and left
+           terminated. (NOTE: dead code physically between the throw and the
+           first catch is not yet skipped -- see M6_EH_AOT_PLAN.md; fine for a
+           throw immediately before its catch.) */
+        BUILD_BR(try_block->llvm_catch_dispatch_block);
         ret = true;
     }
     else {
-        /* Uncaught in this function: like a return, skip the dead code after. */
+        /* Uncaught in this function -- TODO(M6): propagate to the caller via a
+           runtime exception-pending flag; for now (intra-function EH only) it is
+           unreachable. Then skip the dead code after, like a return. */
+        if (!LLVMBuildUnreachable(comp_ctx->builder)) {
+            aot_set_last_error("llvm build unreachable failed.");
+            goto fail;
+        }
         ret = aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
     }
 fail:
@@ -2036,10 +2095,88 @@ bool
 aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                      uint32 tag_index)
 {
-    (void)comp_ctx;
-    (void)func_ctx;
-    (void)tag_index;
-    aot_set_last_error("aot: WASM_OP_CATCH codegen not yet implemented (M6 task 2)");
+    WASMModule *module = comp_ctx->comp_data->wasm_module;
+    WASMFuncType *tag_type;
+    AOTBlock *try_block = func_ctx->block_stack.block_list_end;
+    LLVMBasicBlockRef cur_block, handler_block, next_block;
+    LLVMValueRef tag_val, cmp, value, idx, ptr, tptr;
+    uint32 i, off = 0;
+    uint8 ptype;
+    char name[32];
+
+    if (!try_block || try_block->label_type != LABEL_TYPE_TRY) {
+        aot_set_last_error("catch not directly in a try block.");
+        return false;
+    }
+    if (tag_index >= module->import_tag_count + module->tag_count) {
+        aot_set_last_error("invalid tag index in catch.");
+        return false;
+    }
+    tag_type = module->tags[tag_index]->tag_type;
+
+    /* The preceding section (try body or previous catch handler) falls through
+       to the try end when its block is still live; if it ended in a branch/
+       return/throw the block is already terminated and contributes no result. */
+    cur_block = LLVMGetInsertBlock(comp_ctx->builder);
+    if (cur_block && !LLVMGetBasicBlockTerminator(cur_block)) {
+        if (!try_block->llvm_end_block) {
+            format_block_name(name, sizeof(name), try_block->block_index,
+                              try_block->label_type, LABEL_END);
+            CREATE_BLOCK(try_block->llvm_end_block, name);
+        }
+        CREATE_RESULT_VALUE_PHIS(try_block);
+        for (i = 0; i < try_block->result_count; i++) {
+            uint32 ri = try_block->result_count - 1 - i;
+            POP(value, try_block->result_types[ri]);
+            ADD_TO_RESULT_PHIS(try_block, value, ri);
+        }
+        BUILD_BR(try_block->llvm_end_block);
+    }
+
+    /* Emit this catch's tag test at the dispatch-chain point (the first catch
+       uses the try's catch-dispatch block; later catches use the previous
+       catch's mismatch block). */
+    SET_BUILDER_POS(try_block->llvm_catch_next_block);
+    CREATE_BLOCK(handler_block, "catch_handler");
+    CREATE_BLOCK(next_block, "catch_next");
+    if (!(tag_val = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE,
+                                   func_ctx->exce_tag_alloca, "exce_tag"))) {
+        aot_set_last_error("llvm build load failed.");
+        return false;
+    }
+    if (!(cmp = LLVMBuildICmp(comp_ctx->builder, LLVMIntEQ, tag_val,
+                              I32_CONST(tag_index), "tag_match"))) {
+        aot_set_last_error("llvm build icmp failed.");
+        return false;
+    }
+    BUILD_COND_BR(cmp, handler_block, next_block);
+    try_block->llvm_catch_next_block = next_block;
+
+    /* Handler: reset the try's value stack to empty, then push the exception's
+       param values (loaded from the values buffer) for the handler body. */
+    aot_value_stack_destroy(comp_ctx, &try_block->value_stack);
+    SET_BUILDER_POS(handler_block);
+    for (i = 0; i < tag_type->param_count; i++) {
+        ptype = tag_type->types[i];
+        idx = I32_CONST(off);
+        if (!(ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                          func_ctx->exce_values_alloca, &idx, 1,
+                                          "ev_ptr"))
+            || !(tptr = LLVMBuildBitCast(comp_ctx->builder, ptr,
+                                         LLVMPointerType(TO_LLVM_TYPE(ptype), 0),
+                                         "ev_tptr"))
+            || !(value = LLVMBuildLoad2(comp_ctx->builder, TO_LLVM_TYPE(ptype),
+                                        tptr, "ev"))) {
+            aot_set_last_error("llvm build load exception value failed.");
+            return false;
+        }
+        PUSH(value, ptype);
+        off += wasm_value_type_size_internal(ptype,
+                                             (uint8)comp_ctx->pointer_size);
+    }
+
+    return true;
+fail:
     return false;
 }
 
