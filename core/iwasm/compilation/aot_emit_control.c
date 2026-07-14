@@ -295,6 +295,53 @@ aot_emit_branch_hint(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 }
 #endif
 
+#if WASM_ENABLE_EXCE_HANDLING != 0
+/* Finalize a try's last-catch mismatch edge (its `catch_next` block): an
+   exception matched by no catch of this try re-propagates to the enclosing
+   try's catch-dispatch, or -- with no enclosing try -- the function epilogue
+   (unreachable for now; cross-function propagation is a later increment).
+
+   This MUST run on EVERY try teardown, and a try is torn down at exactly one
+   choke point: handle_next_reachable_block's generic pop of the first reachable
+   block. A normal try reaches it because aot_compile_op_end marks the try
+   reachable and delegates the pop here; a try exited by a `br` targeting the
+   try's OWN end reaches it because op_br marked the try reachable -- and in that
+   case op_end never runs, so finalizing only in op_end would leave catch_next
+   without a terminator. Idempotent: a catch_next already terminated (finalized
+   earlier, or cleared to NULL by catch_all which has no mismatch edge) is left
+   untouched, so it is safe to call unconditionally on any popped block. */
+static bool
+aot_finalize_try_catch_next(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                            AOTBlock *block)
+{
+    LLVMBasicBlockRef save;
+    AOTBlock *outer;
+    bool ok;
+
+    (void)func_ctx;
+    if (block->label_type != LABEL_TYPE_TRY || !block->llvm_catch_next_block
+        || LLVMGetBasicBlockTerminator(block->llvm_catch_next_block))
+        return true;
+
+    save = LLVMGetInsertBlock(comp_ctx->builder);
+    outer = block->prev;
+    while (outer && outer->label_type != LABEL_TYPE_TRY)
+        outer = outer->prev;
+    SET_BUILDER_POS(block->llvm_catch_next_block);
+    ok = outer ? (LLVMBuildBr(comp_ctx->builder,
+                              outer->llvm_catch_dispatch_block)
+                  != NULL)
+               : (LLVMBuildUnreachable(comp_ctx->builder) != NULL);
+    if (!ok) {
+        aot_set_last_error("llvm build terminator failed.");
+        return false;
+    }
+    if (save)
+        SET_BUILDER_POS(save);
+    return true;
+}
+#endif
+
 static bool
 handle_next_reachable_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                             uint8 **p_frame_ip)
@@ -431,6 +478,14 @@ handle_next_reachable_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         *p_frame_ip = block->wasm_code_else + 1;
         return true;
     }
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    /* Single choke point for try teardown: finalize the try's catch_next before
+       it is popped. Covers both the op_end path and a `br` that exits the try by
+       targeting its own end (which bypasses op_end). No-op for non-try blocks. */
+    if (!aot_finalize_try_catch_next(comp_ctx, func_ctx, block))
+        goto fail;
+#endif
 
     *p_frame_ip = block->wasm_code_end + 1;
     SET_BUILDER_POS(block->llvm_end_block);
@@ -941,29 +996,9 @@ aot_compile_op_end(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
 #if WASM_ENABLE_EXCE_HANDLING != 0
-    if (block->label_type == LABEL_TYPE_TRY && block->llvm_catch_next_block
-        && !LLVMGetBasicBlockTerminator(block->llvm_catch_next_block)) {
-        /* The last catch's mismatch edge: an exception not caught by this try
-           re-propagates to the enclosing try's catch-dispatch, or the function's
-           got_exception epilogue if there is no enclosing try. */
-        LLVMBasicBlockRef save = LLVMGetInsertBlock(comp_ctx->builder);
-        AOTBlock *outer = block->prev;
-        bool ok;
-        while (outer && outer->label_type != LABEL_TYPE_TRY)
-            outer = outer->prev;
-        SET_BUILDER_POS(block->llvm_catch_next_block);
-        ok = outer
-                 ? (LLVMBuildBr(comp_ctx->builder,
-                                outer->llvm_catch_dispatch_block)
-                    != NULL)
-                 : (LLVMBuildUnreachable(comp_ctx->builder) != NULL);
-        if (!ok) {
-            aot_set_last_error("llvm build terminator failed.");
-            return false;
-        }
-        if (save)
-            SET_BUILDER_POS(save);
-    }
+    /* A try's catch_next (last-catch mismatch edge) is finalized on teardown at
+       the single choke point in handle_next_reachable_block, reached below once
+       the try is marked reachable -- see aot_finalize_try_catch_next. */
 #endif
 
     /* Create the end block */
