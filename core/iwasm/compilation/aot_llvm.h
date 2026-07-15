@@ -206,6 +206,15 @@ typedef struct AOTBlock {
     LLVMBasicBlockRef llvm_catch_next_block;
     /* The tag index this try's currently-open catch matches (or -1). */
     int32 cur_catch_tag_index;
+    /* For a LABEL_TYPE_TRY block: the address of this try's REAL end opcode
+       (WASM_OP_END, or the WASM_OP_DELEGATE that terminates it). Unlike
+       wasm_code_end -- which for a try is the address of its FIRST catch
+       (that is what wasm_loader_find_block_addr returns for LABEL_TYPE_TRY) --
+       this is the true structural end, past the last catch handler. Used by
+       handle_next_reachable_block to discriminate a completed try (op_end,
+       resume position past this) from a mid-unwind teardown (resume position
+       at/inside the try, e.g. a br targeting the try's own end). */
+    uint8 *try_real_end;
 #endif
 } AOTBlock;
 

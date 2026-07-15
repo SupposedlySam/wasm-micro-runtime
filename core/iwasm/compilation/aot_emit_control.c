@@ -12,6 +12,7 @@
 #endif
 #include "../aot/aot_runtime.h"
 #include "../interpreter/wasm_loader.h"
+#include "../interpreter/wasm_opcode.h"
 #include "../common/wasm_loader_common.h"
 
 #if WASM_ENABLE_DEBUG_AOT != 0
@@ -340,6 +341,54 @@ aot_finalize_try_catch_next(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         SET_BUILDER_POS(save);
     return true;
 }
+
+/* Compute a try's REAL end address. wasm_loader_find_block_addr returns the
+   address of a try's FIRST catch for LABEL_TYPE_TRY (see wasm_loader.c: it stops
+   and returns p-1 at the first depth-1 CATCH/CATCH_ALL/DELEGATE). Walk from that
+   first catch across the remaining catch clauses to the structural end: skip
+   each CATCH's tag-index LEB (CATCH_ALL has no immediate), then scan that
+   handler body with find_block_addr to the next depth-1 catch/end, until the
+   returned opcode is WASM_OP_END or WASM_OP_DELEGATE. */
+static bool
+aot_compute_try_real_end(uint8 *first_catch, uint8 *code_end,
+                         uint8 **p_real_end)
+{
+    BlockAddr blk_cache[BLOCK_ADDR_CACHE_SIZE][BLOCK_ADDR_CONFLICT_SIZE];
+    uint8 *addr = first_catch;
+    uint8 *scan_start, *else_a, *next;
+    uint64 tag_index;
+
+    while (addr < code_end) {
+        uint8 op = *addr;
+        if (op == WASM_OP_END || op == WASM_OP_DELEGATE) {
+            *p_real_end = addr;
+            return true;
+        }
+        if (op != WASM_OP_CATCH && op != WASM_OP_CATCH_ALL) {
+            aot_set_last_error("unexpected opcode scanning try catch clauses.");
+            return false;
+        }
+        scan_start = addr + 1; /* skip the catch/catch_all opcode byte */
+        if (op == WASM_OP_CATCH
+            && !read_leb(&scan_start, code_end, 32, false, &tag_index, NULL, 0)) {
+            aot_set_last_error("read catch tag index failed.");
+            return false;
+        }
+        memset(blk_cache, 0, sizeof(blk_cache));
+        else_a = NULL;
+        next = NULL;
+        if (!wasm_loader_find_block_addr(NULL, (BlockAddr *)blk_cache,
+                                         scan_start, code_end,
+                                         (uint8)LABEL_TYPE_TRY, &else_a,
+                                         &next)) {
+            aot_set_last_error("find try catch/end addr failed.");
+            return false;
+        }
+        addr = next;
+    }
+    aot_set_last_error("try real end not found.");
+    return false;
+}
 #endif
 
 static bool
@@ -480,14 +529,54 @@ handle_next_reachable_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
 #if WASM_ENABLE_EXCE_HANDLING != 0
-    /* Single choke point for try teardown: finalize the try's catch_next before
-       it is popped. Covers both the op_end path and a `br` that exits the try by
-       targeting its own end (which bypasses op_end). No-op for non-try blocks. */
+    if (block->label_type == LABEL_TYPE_TRY
+        && *p_frame_ip <= block->try_real_end) {
+        /* A reachable try whose resume position is still at/inside the try is a
+           mid-unwind teardown, NOT a completion: e.g. a `br` targeting the try's
+           OWN end (op_br marked it reachable + branched to llvm_end_block, but
+           bypassed op_end). The try's catch clauses live inline in the byte
+           stream and still must be compiled, so do NOT pop the try here -- scan
+           to the next catch/catch_all/delegate/end at this try's depth and
+           resume parsing there. The try is torn down and finalized by its own
+           op_end (which then takes the completion path below). This mirrors the
+           dead-code unwinder's LABEL_TYPE_TRY case above. */
+        BlockAddr blk_cache[BLOCK_ADDR_CACHE_SIZE][BLOCK_ADDR_CONFLICT_SIZE];
+        uint8 *scan_start = frame_ip ? frame_ip + 1 : *p_frame_ip;
+        uint8 *code_end =
+            func_ctx->aot_func->code + func_ctx->aot_func->code_size;
+        uint8 *else_a = NULL, *catch_or_end = NULL;
+        memset(blk_cache, 0, sizeof(blk_cache));
+        if (!wasm_loader_find_block_addr(NULL, (BlockAddr *)blk_cache,
+                                         scan_start, code_end,
+                                         (uint8)LABEL_TYPE_TRY, &else_a,
+                                         &catch_or_end)) {
+            aot_set_last_error("find try catch/end addr failed.");
+            return false;
+        }
+        aot_value_stack_destroy(comp_ctx, &block->value_stack);
+        *p_frame_ip = catch_or_end;
+        return true;
+    }
+
+    /* Single choke point for try completion teardown: finalize the try's
+       catch_next before it is popped. A completing try reaches here from its own
+       op_end (the mid-unwind cases -- a throw, a handler ending in br/return/
+       throw, or a br to the try's own end -- are handled above and defer teardown
+       to that op_end). No-op for non-try blocks. Idempotent regardless. */
     if (!aot_finalize_try_catch_next(comp_ctx, func_ctx, block))
         goto fail;
-#endif
 
+    /* For a completing try, *p_frame_ip already points just past the real end
+       (op_end advanced it). Do NOT overwrite it with wasm_code_end + 1: a try's
+       wasm_code_end is its FIRST catch address, so that would rewind the parser
+       into the catch's operand bytes and drop all code after the try (the
+       miscompile this fixes). Every other block type has wasm_code_end == real
+       end, so the original assignment is preserved for them. */
+    if (block->label_type != LABEL_TYPE_TRY)
+        *p_frame_ip = block->wasm_code_end + 1;
+#else
     *p_frame_ip = block->wasm_code_end + 1;
+#endif
     SET_BUILDER_POS(block->llvm_end_block);
 
     /* Pop block, push its return value, and destroy the block */
@@ -736,6 +825,15 @@ aot_compile_op_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
     block->wasm_code_else = else_addr;
     block->wasm_code_end = end_addr;
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    /* For a try, end_addr is the FIRST catch, not the structural end. Record the
+       real end so handle_next_reachable_block can tell a completed try (op_end)
+       from a mid-unwind teardown (e.g. br to the try's own end). */
+    if (label_type == LABEL_TYPE_TRY
+        && !aot_compute_try_real_end(end_addr, frame_ip_end,
+                                     &block->try_real_end))
+        goto fail;
+#endif
     block->block_index = func_ctx->block_stack.block_index[label_type];
     func_ctx->block_stack.block_index[label_type]++;
 
