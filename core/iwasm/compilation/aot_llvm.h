@@ -215,6 +215,12 @@ typedef struct AOTBlock {
        resume position past this) from a mid-unwind teardown (resume position
        at/inside the try, e.g. a br targeting the try's own end). */
     uint8 *try_real_end;
+    /* For a LABEL_TYPE_TRY block: set true once its catch handlers begin emitting
+       (at the first catch/catch_all). A throw executed inside this try's own
+       handler must NOT be caught by this try -- it propagates to the ENCLOSING
+       try (the interpreter's find_a_catch_handler skips CATCH/CATCH_ALL frames).
+       op_throw's enclosing-try search skips a try with in_handler set. */
+    bool in_handler;
 #endif
 } AOTBlock;
 

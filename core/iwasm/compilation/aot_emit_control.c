@@ -2201,7 +2201,8 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
        to the function's got_exception epilogue (cross-function propagation via a
        runtime pending flag + per-call checks is the next increment). */
     try_block = func_ctx->block_stack.block_list_end;
-    while (try_block && try_block->label_type != LABEL_TYPE_TRY)
+    while (try_block
+           && (try_block->label_type != LABEL_TYPE_TRY || try_block->in_handler))
         try_block = try_block->prev;
 
     if (try_block) {
@@ -2238,21 +2239,22 @@ aot_compile_op_rethrow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
        model a catch handler runs with its TRY block on the stack, so count TRY
        blocks: relative_depth 0 is the innermost. Re-propagate to that try's
        enclosing try dispatch, or unreachable if uncaught (cross-function TODO). */
-    AOTBlock *block = func_ctx->block_stack.block_list_end;
-    AOTBlock *target = NULL, *outer;
+    /* relative_depth is a control-label depth (like br): count ALL enclosing
+       frames, not only trys. The frame at that depth is the try whose handler we
+       are re-throwing from (validation guarantees it is a TRY). Re-propagate the
+       in-flight exception to the handlers enclosing THAT try -- its nearest
+       enclosing try that we are not already handling (skip in_handler, as
+       op_throw does). */
+    AOTBlock *target = func_ctx->block_stack.block_list_end;
+    AOTBlock *outer;
     uint32 d = relative_depth;
 
-    for (; block; block = block->prev) {
-        if (block->label_type == LABEL_TYPE_TRY) {
-            if (d == 0) {
-                target = block;
-                break;
-            }
-            d--;
-        }
+    while (d > 0 && target) {
+        target = target->prev;
+        d--;
     }
     outer = target ? target->prev : NULL;
-    while (outer && outer->label_type != LABEL_TYPE_TRY)
+    while (outer && (outer->label_type != LABEL_TYPE_TRY || outer->in_handler))
         outer = outer->prev;
     if (outer) {
         BUILD_BR(outer->llvm_catch_dispatch_block);
@@ -2335,6 +2337,10 @@ aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     BUILD_COND_BR(cmp, handler_block, next_block);
     try_block->llvm_catch_next_block = next_block;
 
+    /* From here on we emit this try's handler body: a throw inside it must
+       propagate to the ENCLOSING try, not be re-caught here. */
+    try_block->in_handler = true;
+
     /* Handler: reset the try's value stack to empty, then push the exception's
        param values (loaded from the values buffer) for the handler body. */
     aot_value_stack_destroy(comp_ctx, &try_block->value_stack);
@@ -2404,6 +2410,10 @@ aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
     CREATE_BLOCK(handler_block, "catch_all_handler");
     BUILD_BR(handler_block);
     try_block->llvm_catch_next_block = NULL;
+
+    /* Emitting this try's handler: a throw inside it propagates to the enclosing
+       try, not back into this one. */
+    try_block->in_handler = true;
 
     aot_value_stack_destroy(comp_ctx, &try_block->value_stack);
     SET_BUILDER_POS(handler_block);
