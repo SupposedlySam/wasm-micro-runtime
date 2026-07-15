@@ -36,7 +36,7 @@ is_win_platform(AOTCompContext *comp_ctx)
     return ret;
 }
 
-static bool
+bool
 create_func_return_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
 {
     LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
@@ -68,6 +68,45 @@ create_func_return_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
     LLVMPositionBuilderAtEnd(comp_ctx->builder, block_curr);
     return true;
 }
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+/* A module that declares exception tags can propagate a wasm `throw` across a
+   call by leaving it pending in the instance's cur_exception buffer (a normal
+   return, not a HW trap/longjmp). The caller must therefore check cur_exception
+   after every call so an enclosing try can catch it -- even when HW bound-checks
+   would otherwise let the post-call exception check be elided. */
+static bool
+aot_module_has_tags(AOTCompContext *comp_ctx)
+{
+    WASMModule *module = comp_ctx->comp_data->wasm_module;
+    return (module->import_tag_count + module->tag_count) > 0;
+}
+
+/* Create (once) the EH-propagation return block: a PLAIN zeroed return. Distinct
+   from func_return_block, which under HW bound checks accesses the guard page to
+   deliver a trap via longjmp -- that would unwind past an enclosing try in the
+   caller. A propagated wasm exception must instead return normally (cur_exception
+   stays set) so the caller's post-call check routes it to its own catch. */
+bool
+create_func_eh_return_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
+{
+    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
+    AOTFuncType *aot_func_type = func_ctx->aot_func->func_type;
+
+    if (!func_ctx->eh_return_block) {
+        if (!(func_ctx->eh_return_block = LLVMAppendBasicBlockInContext(
+                  comp_ctx->context, func_ctx->func, "eh_return"))) {
+            aot_set_last_error("llvm add basic block failed.");
+            return false;
+        }
+        LLVMPositionBuilderAtEnd(comp_ctx->builder, func_ctx->eh_return_block);
+        if (!aot_build_zero_function_ret(comp_ctx, func_ctx, aot_func_type))
+            return false;
+        LLVMPositionBuilderAtEnd(comp_ctx->builder, block_curr);
+    }
+    return true;
+}
+#endif
 
 /* Check whether there was exception thrown, if yes, return directly */
 static bool
@@ -101,6 +140,70 @@ check_exception_thrown(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
     LLVMMoveBasicBlockAfter(check_exce_succ, block_curr);
 
     LLVMPositionBuilderAtEnd(comp_ctx->builder, block_curr);
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    /* In a module that uses exceptions, a callee's wasm `throw` surfaces here as
+       a pending exception (cur_exception[0]==0x01) after a plain return. Route
+       it 3-way rather than always returning:
+         [0]==0    -> success (no exception),
+         [0]==0x01 -> a WASM exception: to the innermost enclosing try's catch
+                      dispatch if one exists, else propagate to OUR caller via a
+                      plain return (eh_return_block),
+         otherwise -> a real runtime trap: deliver via func_return_block.
+       The enclosing-try search skips trys whose own handler we're inside
+       (in_handler), mirroring aot_compile_op_throw. */
+    if (aot_module_has_tags(comp_ctx)) {
+        AOTBlock *try_block = func_ctx->block_stack.block_list_end;
+        LLVMBasicBlockRef exce_pending, wasm_exce_target;
+        LLVMValueRef is_wasm_exce;
+
+        while (try_block
+               && (try_block->label_type != LABEL_TYPE_TRY
+                   || try_block->in_handler))
+            try_block = try_block->prev;
+
+        if (try_block) {
+            wasm_exce_target = try_block->llvm_catch_dispatch_block;
+        }
+        else {
+            if (!create_func_eh_return_block(comp_ctx, func_ctx))
+                return false;
+            wasm_exce_target = func_ctx->eh_return_block;
+        }
+
+        if (!(exce_pending = LLVMAppendBasicBlockInContext(
+                  comp_ctx->context, func_ctx->func, "exce_pending"))) {
+            aot_set_last_error("llvm add basic block failed.");
+            return false;
+        }
+        LLVMMoveBasicBlockAfter(exce_pending, block_curr);
+
+        /* cur_exception[0]==0 -> success, else discriminate in exce_pending. */
+        if (!LLVMBuildCondBr(comp_ctx->builder, cmp, check_exce_succ,
+                             exce_pending)) {
+            aot_set_last_error("llvm build cond br failed.");
+            return false;
+        }
+
+        LLVMPositionBuilderAtEnd(comp_ctx->builder, exce_pending);
+        /* `value` (the marker byte) dominates exce_pending; reuse it. */
+        if (!(is_wasm_exce = LLVMBuildICmp(
+                  comp_ctx->builder, LLVMIntEQ, value,
+                  LLVMConstInt(INT8_TYPE, 0x01, false), "is_wasm_exce"))) {
+            aot_set_last_error("llvm build icmp failed.");
+            return false;
+        }
+        if (!LLVMBuildCondBr(comp_ctx->builder, is_wasm_exce, wasm_exce_target,
+                             func_ctx->func_return_block)) {
+            aot_set_last_error("llvm build cond br failed.");
+            return false;
+        }
+
+        LLVMPositionBuilderAtEnd(comp_ctx->builder, check_exce_succ);
+        return true;
+    }
+#endif /* WASM_ENABLE_EXCE_HANDLING != 0 */
+
     /* Create condition br */
     if (!LLVMBuildCondBr(comp_ctx->builder, cmp, check_exce_succ,
                          func_ctx->func_return_block)) {
@@ -1816,7 +1919,11 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         /* Check whether there was exception thrown when executing
            the function */
         if (!tail_call
-            && (comp_ctx->enable_bound_check || is_win_platform(comp_ctx))
+            && (comp_ctx->enable_bound_check || is_win_platform(comp_ctx)
+#if WASM_ENABLE_EXCE_HANDLING != 0
+                || aot_module_has_tags(comp_ctx)
+#endif
+                    )
             && !check_exception_thrown(comp_ctx, func_ctx))
             goto fail;
     }
@@ -2682,7 +2789,11 @@ aot_compile_op_call_indirect(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
     /* Check whether exception was thrown when executing the function */
-    if ((comp_ctx->enable_bound_check || is_win_platform(comp_ctx))
+    if ((comp_ctx->enable_bound_check || is_win_platform(comp_ctx)
+#if WASM_ENABLE_EXCE_HANDLING != 0
+         || aot_module_has_tags(comp_ctx)
+#endif
+             )
         && !check_exception_thrown(comp_ctx, func_ctx))
         goto fail;
 
@@ -3190,7 +3301,11 @@ aot_compile_op_call_ref(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
     /* Check whether exception was thrown when executing the function */
     if (!tail_call
-        && (comp_ctx->enable_bound_check || is_win_platform(comp_ctx))
+        && (comp_ctx->enable_bound_check || is_win_platform(comp_ctx)
+#if WASM_ENABLE_EXCE_HANDLING != 0
+            || aot_module_has_tags(comp_ctx)
+#endif
+                )
         && !check_exception_thrown(comp_ctx, func_ctx))
         goto fail;
 

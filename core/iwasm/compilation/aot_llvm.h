@@ -297,15 +297,18 @@ typedef struct AOTFuncContext {
     /* current ip when exception is thrown */
     LLVMValueRef exception_ip_phi;
     LLVMValueRef func_type_indexes;
+    /* NOTE: the in-flight wasm exception (marker/tag/param-values) is stored in
+       the module instance's cur_exception buffer -- see func_ctx->cur_exception
+       and the layout comment in aot_emit_control.c. That instance-state buffer
+       doubles as the cross-call channel, so no per-function exception storage is
+       needed here. */
 #if WASM_ENABLE_EXCE_HANDLING != 0
-    /* Lazily-created entry-block storage for the in-flight wasm exception, so a
-       `catch` can read what a `throw` recorded. exce_tag_alloca holds the thrown
-       tag index (i32, -1 == none); exce_values_alloca is a byte buffer holding
-       the tag's param values (sized to the widest tag in the module). Created in
-       the entry block so they dominate every throw and catch site. */
-    LLVMValueRef exce_tag_alloca;
-    LLVMValueRef exce_values_alloca;
-    uint32 exce_values_size;
+    /* A return block that propagates a pending wasm exception to the caller with
+       a PLAIN zeroed return (no HW-bound-check guard-page trap delivery, unlike
+       func_return_block). Required so the caller's post-call check can observe
+       cur_exception and let an enclosing try catch it instead of longjmp-ing all
+       the way out to the host. Lazily created. */
+    LLVMBasicBlockRef eh_return_block;
 #endif
 #if WASM_ENABLE_DEBUG_AOT != 0
     LLVMMetadataRef debug_func;

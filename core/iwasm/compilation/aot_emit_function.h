@@ -12,6 +12,18 @@
 extern "C" {
 #endif
 
+/* Create (once) the function's return epilogue block. Exposed so the EH
+   codegen in aot_emit_control.c can propagate an uncaught wasm exception to the
+   caller by branching to it (the pending exception is recorded in the instance's
+   cur_exception buffer, which the caller re-checks after the call). */
+bool
+create_func_return_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+bool
+create_func_eh_return_block(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
+#endif
+
 bool
 aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                     uint32 func_idx, bool tail_call);

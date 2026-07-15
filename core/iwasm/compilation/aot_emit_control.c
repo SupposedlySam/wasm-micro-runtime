@@ -6,6 +6,7 @@
 #include "aot_emit_control.h"
 #include "aot_compiler.h"
 #include "aot_emit_exception.h"
+#include "aot_emit_function.h"
 #include "aot_stack_frame_comp.h"
 #if WASM_ENABLE_GC != 0
 #include "aot_emit_gc.h"
@@ -319,7 +320,6 @@ aot_finalize_try_catch_next(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     AOTBlock *outer;
     bool ok;
 
-    (void)func_ctx;
     if (block->label_type != LABEL_TYPE_TRY || !block->llvm_catch_next_block
         || LLVMGetBasicBlockTerminator(block->llvm_catch_next_block))
         return true;
@@ -329,10 +329,19 @@ aot_finalize_try_catch_next(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     while (outer && outer->label_type != LABEL_TYPE_TRY)
         outer = outer->prev;
     SET_BUILDER_POS(block->llvm_catch_next_block);
-    ok = outer ? (LLVMBuildBr(comp_ctx->builder,
-                              outer->llvm_catch_dispatch_block)
-                  != NULL)
-               : (LLVMBuildUnreachable(comp_ctx->builder) != NULL);
+    if (outer) {
+        /* Unmatched by this try -> re-propagate to the enclosing try's dispatch
+           (the marker is still set; it was cleared only on a match). */
+        ok = LLVMBuildBr(comp_ctx->builder, outer->llvm_catch_dispatch_block)
+             != NULL;
+    }
+    else {
+        /* No enclosing try -> propagate the still-pending exception to the
+           caller via a plain return (not the trap-delivering epilogue). */
+        if (!create_func_eh_return_block(comp_ctx, func_ctx))
+            return false;
+        ok = LLVMBuildBr(comp_ctx->builder, func_ctx->eh_return_block) != NULL;
+    }
     if (!ok) {
         aot_set_last_error("llvm build terminator failed.");
         return false;
@@ -2075,71 +2084,74 @@ fail:
    the next increments (route_a/M6_EH_AOT_PLAN.md) and fail with a NAMED error
    rather than silently mis-compiling. */
 
-/* Lazily create the entry-block exception storage so it dominates every throw
-   and catch in the function. */
-static bool
-aot_ensure_exce_storage(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
+/* Unified exception channel: the in-flight wasm exception lives in the module
+   instance's cur_exception[128] byte buffer (func_ctx->cur_exception points at
+   byte 0). Because it is instance state -- not a per-function alloca -- it is
+   also the CROSS-CALL channel: a throw in a callee writes it, and the caller's
+   post-call check (check_exception_thrown) reads it. Layout:
+     [0]     u8   marker: 0x01 == a pending WASM exception. 0 == none. A runtime
+                  trap leaves a printable-ASCII message here (>= 0x20), so 0x01
+                  unambiguously means "a wasm `throw` is in flight".
+     [4..7]  u32  tag index.
+     [8..]   packed param values (same per-param byte offsets computed by throw
+                  and read by catch; <= 120 bytes, ample for dart2wasm tags).
+   The GC-ref-across-a-GC hazard (a ref value parked in cur_exception is not a GC
+   root) is a known, separate gap -- not addressed here. */
+#define EXCE_MARKER_OFFSET 0
+#define EXCE_TAG_OFFSET 4
+#define EXCE_VALUES_OFFSET 8
+#define EXCE_WASM_MARKER 0x01
+
+/* Pointer to byte `offset` within cur_exception. If elem_type != INT8_TYPE the
+   pointer is bit-cast to elem_type* so a typed load/store lands there. */
+static LLVMValueRef
+aot_exce_field_ptr(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                   uint32 offset, LLVMTypeRef elem_type, const char *name)
 {
-    WASMModule *module = comp_ctx->comp_data->wasm_module;
-    LLVMBuilderRef builder = comp_ctx->builder;
-    LLVMBasicBlockRef cur_block, entry_block;
-    LLVMValueRef first_instr;
-    uint32 i, j, sz, max_size = 0;
-    uint32 tag_total = module->import_tag_count + module->tag_count;
+    LLVMValueRef idx = I32_CONST(offset), ptr;
 
-    if (func_ctx->exce_tag_alloca)
-        return true;
-
-    for (i = 0; i < tag_total; i++) {
-        WASMFuncType *tt = module->tags[i]->tag_type;
-        sz = 0;
-        for (j = 0; j < tt->param_count; j++)
-            sz += wasm_value_type_size_internal(
-                tt->types[j], (uint8)comp_ctx->pointer_size);
-        if (sz > max_size)
-            max_size = sz;
+    if (!(ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                      func_ctx->cur_exception, &idx, 1,
+                                      "exce_fld"))) {
+        aot_set_last_error("llvm build gep into cur_exception failed.");
+        return NULL;
     }
-    if (max_size == 0)
-        max_size = 4;
-    func_ctx->exce_values_size = max_size;
+    if (elem_type == INT8_TYPE)
+        return ptr;
+    if (!(ptr = LLVMBuildBitCast(comp_ctx->builder, ptr,
+                                 LLVMPointerType(elem_type, 0), name))) {
+        aot_set_last_error("llvm build bitcast for cur_exception failed.");
+        return NULL;
+    }
+    return ptr;
+}
 
-    cur_block = LLVMGetInsertBlock(builder);
-    entry_block = LLVMGetEntryBasicBlock(func_ctx->func);
-    first_instr = LLVMGetFirstInstruction(entry_block);
-    if (first_instr)
-        LLVMPositionBuilderBefore(builder, first_instr);
-    else
-        LLVMPositionBuilderAtEnd(builder, entry_block);
-
-    func_ctx->exce_tag_alloca = LLVMBuildAlloca(builder, I32_TYPE, "exce_tag");
-    func_ctx->exce_values_alloca =
-        LLVMBuildArrayAlloca(builder, INT8_TYPE, I32_CONST(max_size),
-                             "exce_values");
-    LLVMPositionBuilderAtEnd(builder, cur_block);
-
-    if (!func_ctx->exce_tag_alloca || !func_ctx->exce_values_alloca) {
-        aot_set_last_error("llvm build alloca failed for exception storage.");
+/* Set (0x01) or clear (0) the "wasm exception pending" marker byte. */
+static bool
+aot_store_exce_marker(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                      uint8 marker)
+{
+    LLVMValueRef ptr = aot_exce_field_ptr(comp_ctx, func_ctx,
+                                          EXCE_MARKER_OFFSET, INT8_TYPE, NULL);
+    if (!ptr
+        || !LLVMBuildStore(comp_ctx->builder, I8_CONST(marker), ptr)) {
+        aot_set_last_error("llvm build store exce marker failed.");
         return false;
     }
     return true;
 }
 
-/* Store `value` (of wasm type value_type) at byte `offset` in the exception
-   values buffer. */
+/* Store `value` (of wasm type value_type) at byte `offset` in the param-values
+   region (cur_exception + EXCE_VALUES_OFFSET + offset). */
 static bool
 aot_store_exce_value(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                      uint32 offset, LLVMValueRef value, uint8 value_type)
 {
-    LLVMValueRef idx = I32_CONST(offset), ptr, tptr;
     LLVMTypeRef llvm_type = TO_LLVM_TYPE(value_type);
-
-    if (!(ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
-                                      func_ctx->exce_values_alloca, &idx, 1,
-                                      "exce_val_ptr"))
-        || !(tptr = LLVMBuildBitCast(comp_ctx->builder, ptr,
-                                     LLVMPointerType(llvm_type, 0),
-                                     "exce_val_tptr"))
-        || !LLVMBuildStore(comp_ctx->builder, value, tptr)) {
+    LLVMValueRef tptr = aot_exce_field_ptr(comp_ctx, func_ctx,
+                                           EXCE_VALUES_OFFSET + offset,
+                                           llvm_type, "exce_val_tptr");
+    if (!tptr || !LLVMBuildStore(comp_ctx->builder, value, tptr)) {
         aot_set_last_error("llvm build store exception value failed.");
         return false;
     }
@@ -2153,7 +2165,6 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     WASMModule *module = comp_ctx->comp_data->wasm_module;
     WASMFuncType *tag_type;
     AOTBlock *try_block;
-    LLVMBasicBlockRef target;
     LLVMValueRef value, tag_val;
     uint32 *offsets = NULL;
     uint32 i, off = 0, param_count;
@@ -2166,9 +2177,6 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
     tag_type = module->tags[tag_index]->tag_type;
     param_count = tag_type->param_count;
-
-    if (!aot_ensure_exce_storage(comp_ctx, func_ctx))
-        return false;
 
     if (param_count > 0) {
         if (!(offsets = wasm_runtime_malloc((uint32)sizeof(uint32) * param_count))) {
@@ -2190,16 +2198,26 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         }
     }
 
+    /* Record tag index and set the "wasm exception pending" marker in the
+       instance's cur_exception buffer -- the single source of truth for both
+       intra-function catches and cross-call propagation. */
     tag_val = I32_CONST(tag_index);
-    if (!LLVMBuildStore(comp_ctx->builder, tag_val, func_ctx->exce_tag_alloca)) {
-        aot_set_last_error("llvm build store failed.");
-        goto fail;
+    {
+        LLVMValueRef tag_ptr = aot_exce_field_ptr(
+            comp_ctx, func_ctx, EXCE_TAG_OFFSET, I32_TYPE, "exce_tag_ptr");
+        if (!tag_ptr
+            || !LLVMBuildStore(comp_ctx->builder, tag_val, tag_ptr)) {
+            aot_set_last_error("llvm build store exce tag failed.");
+            goto fail;
+        }
     }
+    if (!aot_store_exce_marker(comp_ctx, func_ctx, EXCE_WASM_MARKER))
+        goto fail;
 
     /* Branch to the innermost enclosing try's catch dispatch. If there is no
-       enclosing try in this function the exception is uncaught here: for now go
-       to the function's got_exception epilogue (cross-function propagation via a
-       runtime pending flag + per-call checks is the next increment). */
+       enclosing try in this function the exception is uncaught here and must
+       propagate to the CALLER: the marker is set, so return via the function
+       epilogue -- the caller's post-call check re-reads cur_exception. */
     try_block = func_ctx->block_stack.block_list_end;
     while (try_block
            && (try_block->label_type != LABEL_TYPE_TRY || try_block->in_handler))
@@ -2215,13 +2233,14 @@ aot_compile_op_throw(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         ret = aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
     }
     else {
-        /* Uncaught in this function -- TODO(M6): propagate to the caller via a
-           runtime exception-pending flag; for now (intra-function EH only) it is
-           unreachable. Then skip the dead code after, like a return. */
-        if (!LLVMBuildUnreachable(comp_ctx->builder)) {
-            aot_set_last_error("llvm build unreachable failed.");
+        /* Uncaught in this function: propagate to the caller. cur_exception now
+           holds the pending marker + tag + values; return NORMALLY via the EH
+           return block (a plain zeroed return -- NOT the trap-delivering
+           func_return_block) so the caller's post-call check observes the
+           pending exception. Then skip the dead code after, like a return. */
+        if (!create_func_eh_return_block(comp_ctx, func_ctx))
             goto fail;
-        }
+        BUILD_BR(func_ctx->eh_return_block);
         ret = aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
     }
 fail:
@@ -2256,12 +2275,23 @@ aot_compile_op_rethrow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     outer = target ? target->prev : NULL;
     while (outer && (outer->label_type != LABEL_TYPE_TRY || outer->in_handler))
         outer = outer->prev;
+
+    /* The enclosing catch cleared the marker when it matched; re-arm it so the
+       exception is pending again for whoever catches the rethrow (tag + values
+       are still intact in cur_exception). Needed for the cross-call case, where
+       the caller's post-call check reads the marker. */
+    if (!aot_store_exce_marker(comp_ctx, func_ctx, EXCE_WASM_MARKER))
+        return false;
+
     if (outer) {
         BUILD_BR(outer->llvm_catch_dispatch_block);
     }
-    else if (!LLVMBuildUnreachable(comp_ctx->builder)) {
-        aot_set_last_error("llvm build unreachable failed.");
-        return false;
+    else {
+        /* No enclosing try: the re-thrown exception (still pending in
+           cur_exception) propagates to the caller via a plain return. */
+        if (!create_func_eh_return_block(comp_ctx, func_ctx))
+            return false;
+        BUILD_BR(func_ctx->eh_return_block);
     }
     return aot_handle_next_reachable_block(comp_ctx, func_ctx, p_frame_ip);
 fail:
@@ -2276,7 +2306,7 @@ aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     WASMFuncType *tag_type;
     AOTBlock *try_block = func_ctx->block_stack.block_list_end;
     LLVMBasicBlockRef cur_block, handler_block, next_block;
-    LLVMValueRef tag_val, cmp, value, idx, ptr, tptr;
+    LLVMValueRef tag_val, cmp, value, tag_ptr, tptr;
     uint32 i, off = 0;
     uint8 ptype;
     char name[32];
@@ -2290,14 +2320,6 @@ aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         return false;
     }
     tag_type = module->tags[tag_index]->tag_type;
-
-    /* Ensure the exception storage exists: a function may CATCH without itself
-       THROWing (the exception was thrown in a callee), so the storage was not
-       created by a throw here. (NOTE: cross-function reads of a per-function
-       alloca are not yet correct -- that needs the runtime exception state; this
-       just avoids a NULL deref so the module compiles. See M6_EH_AOT_PLAN.md.) */
-    if (!aot_ensure_exce_storage(comp_ctx, func_ctx))
-        return false;
 
     /* The preceding section (try body or previous catch handler) falls through
        to the try end when its block is still live; if it ended in a branch/
@@ -2324,9 +2346,11 @@ aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     SET_BUILDER_POS(try_block->llvm_catch_next_block);
     CREATE_BLOCK(handler_block, "catch_handler");
     CREATE_BLOCK(next_block, "catch_next");
-    if (!(tag_val = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE,
-                                   func_ctx->exce_tag_alloca, "exce_tag"))) {
-        aot_set_last_error("llvm build load failed.");
+    if (!(tag_ptr = aot_exce_field_ptr(comp_ctx, func_ctx, EXCE_TAG_OFFSET,
+                                       I32_TYPE, "exce_tag_ptr"))
+        || !(tag_val = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE, tag_ptr,
+                                      "exce_tag"))) {
+        aot_set_last_error("llvm build load exce tag failed.");
         return false;
     }
     if (!(cmp = LLVMBuildICmp(comp_ctx->builder, LLVMIntEQ, tag_val,
@@ -2341,19 +2365,18 @@ aot_compile_op_catch(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
        propagate to the ENCLOSING try, not be re-caught here. */
     try_block->in_handler = true;
 
-    /* Handler: reset the try's value stack to empty, then push the exception's
-       param values (loaded from the values buffer) for the handler body. */
+    /* Handler: reset the try's value stack to empty, clear the pending marker
+       (the exception is now handled), then push the exception's param values
+       (loaded from cur_exception) for the handler body. */
     aot_value_stack_destroy(comp_ctx, &try_block->value_stack);
     SET_BUILDER_POS(handler_block);
+    if (!aot_store_exce_marker(comp_ctx, func_ctx, 0))
+        return false;
     for (i = 0; i < tag_type->param_count; i++) {
         ptype = tag_type->types[i];
-        idx = I32_CONST(off);
-        if (!(ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
-                                          func_ctx->exce_values_alloca, &idx, 1,
-                                          "ev_ptr"))
-            || !(tptr = LLVMBuildBitCast(comp_ctx->builder, ptr,
-                                         LLVMPointerType(TO_LLVM_TYPE(ptype), 0),
-                                         "ev_tptr"))
+        if (!(tptr = aot_exce_field_ptr(comp_ctx, func_ctx,
+                                        EXCE_VALUES_OFFSET + off,
+                                        TO_LLVM_TYPE(ptype), "ev_tptr"))
             || !(value = LLVMBuildLoad2(comp_ctx->builder, TO_LLVM_TYPE(ptype),
                                         tptr, "ev"))) {
             aot_set_last_error("llvm build load exception value failed.");
@@ -2382,8 +2405,6 @@ aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
         aot_set_last_error("catch_all not directly in a try block.");
         return false;
     }
-    if (!aot_ensure_exce_storage(comp_ctx, func_ctx))
-        return false;
 
     /* Preceding section (try body or a prior catch handler) falls through to the
        try end if its block is still live. */
@@ -2415,8 +2436,12 @@ aot_compile_op_catch_all(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx)
        try, not back into this one. */
     try_block->in_handler = true;
 
+    /* catch_all matches unconditionally -> the exception is handled; clear the
+       pending marker so the function returns normally afterwards. */
     aot_value_stack_destroy(comp_ctx, &try_block->value_stack);
     SET_BUILDER_POS(handler_block);
+    if (!aot_store_exce_marker(comp_ctx, func_ctx, 0))
+        return false;
     return true;
 fail:
     return false;
