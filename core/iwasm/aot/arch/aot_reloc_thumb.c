@@ -386,20 +386,35 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
 
             result += initial_addend;
 
-            /* Check overflow: +-4MB */
-            if (result > (4 * BH_MB) || result < (-4 * BH_MB)) {
+            /* Thumb-2 BL/B.W on ARMv8-M reach +-16MB (S:I1:I2:imm10:imm11), not
+               the +-4MB the original imm10:imm11-only encoding assumed. A large
+               module (the Flutter counter's .text is ~4.2MB) has intra-module
+               branches beyond 4MB, so encode the full 24-bit form incl. J1/J2. */
+            (void)result_masked;
+            (void)RESULT_MASK;
+            if (result > (16 * BH_MB) || result < (-16 * BH_MB)) {
                 set_error_buf(error_buf, error_buf_size,
                               "AOT module load failed: "
                               "target address out of range.");
                 return false;
             }
 
-            result_masked = (int32)result & RESULT_MASK;
-            initial_addend_0 = (result_masked >> 12) & 0x7FF;
-            initial_addend_1 = (result_masked >> 1) & 0x7FF;
-
-            *reloc_addr = (*reloc_addr & ~0x7FF) | initial_addend_0;
-            *(reloc_addr + 1) = (*(reloc_addr + 1) & ~0x7FF) | initial_addend_1;
+            {
+                uint32 off = (uint32)result;
+                uint32 s = (off >> 24) & 0x1;
+                uint32 i1 = (off >> 23) & 0x1;
+                uint32 i2 = (off >> 22) & 0x1;
+                uint32 imm10 = (off >> 12) & 0x3FF;
+                uint32 imm11 = (off >> 1) & 0x7FF;
+                uint32 j1 = i1 ^ s ^ 0x1; /* I1 = NOT(J1 EOR S) */
+                uint32 j2 = i2 ^ s ^ 0x1;
+                /* HW1: 11110 S imm10 ; HW2: 11 J1 1 J2 imm11 (BL/B.W fixed bits
+                   preserved via the masks) */
+                *reloc_addr =
+                    (int16)((*reloc_addr & 0xF800) | (s << 10) | imm10);
+                *(reloc_addr + 1) = (int16)((*(reloc_addr + 1) & 0xD000)
+                                            | (j1 << 13) | (j2 << 11) | imm11);
+            }
             break;
         }
         case R_ARM_ABS32:
