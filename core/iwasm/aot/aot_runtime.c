@@ -283,6 +283,57 @@ init_global_data(uint8 *global_data, uint8 type, WASMValue *initial_value)
 }
 
 #if WASM_ENABLE_GC != 0
+/**
+ * Read a global's value back out of the instance's global data.
+ * This is the inverse of init_global_data() and is used to resolve a
+ * `global.get` inside a constant expression: the value of a defined global
+ * is the value that was computed for it at instantiation time, which only
+ * exists in the global data -- it cannot be recovered from its init expr.
+ */
+static void
+get_global_data(const uint8 *global_data, uint8 type, WASMValue *value)
+{
+    memset(value, 0, sizeof(WASMValue));
+
+    switch (type) {
+        case VALUE_TYPE_I32:
+        case VALUE_TYPE_F32:
+#if WASM_ENABLE_REF_TYPES != 0
+        case VALUE_TYPE_FUNCREF:
+        case VALUE_TYPE_EXTERNREF:
+#endif
+            value->i32 = *(const int32 *)global_data;
+            break;
+        case VALUE_TYPE_I64:
+        case VALUE_TYPE_F64:
+            bh_memcpy_s(&value->i64, sizeof(int64), global_data,
+                        sizeof(int64));
+            break;
+#if WASM_ENABLE_SIMD != 0
+        case VALUE_TYPE_V128:
+            bh_memcpy_s(&value->v128, sizeof(V128), global_data, sizeof(V128));
+            break;
+#endif
+        default:
+            if ((type >= (uint8)REF_TYPE_ARRAYREF
+                 && type <= (uint8)REF_TYPE_NULLFUNCREF)
+                || (type >= (uint8)REF_TYPE_HT_NULLABLE
+                    && type <= (uint8)REF_TYPE_HT_NON_NULLABLE)
+#if WASM_ENABLE_STRINGREF != 0
+                || (type >= (uint8)REF_TYPE_STRINGVIEWWTF8
+                    && type <= (uint8)REF_TYPE_STRINGREF)
+                || (type >= (uint8)REF_TYPE_STRINGVIEWITER
+                    && type <= (uint8)REF_TYPE_STRINGVIEWWTF16)
+#endif
+            ) {
+                bh_memcpy_s(&value->gc_obj, sizeof(wasm_obj_t), global_data,
+                            sizeof(wasm_obj_t));
+                break;
+            }
+            bh_assert(0);
+    }
+}
+
 static bool
 assign_table_init_value(AOTModuleInstance *module_inst, AOTModule *module,
                         InitializerExpression *init_expr, void *addr,
@@ -489,10 +540,23 @@ get_init_value_recursive(AOTModuleInstance *module_inst, AOTModule *module,
                              .global_data_linked;
             }
             else {
-                *value = module
-                             ->globals[expr->u.unary.v.global_index
-                                       - module->import_global_count]
-                             .init_expr.u.unary.v;
+                AOTGlobal *ref_global =
+                    &module->globals[expr->u.unary.v.global_index
+                                     - module->import_global_count];
+
+                /* Take the referenced global's COMPUTED value from the global
+                   data, not the payload of its init expr. The two only
+                   coincide for scalar consts: for a GC global built by
+                   struct.new/array.new*, `init_expr.u.unary.v` holds loader
+                   metadata (e.g. a WASMArrayNewInitValues *), not the object
+                   that global_instantiate() created -- copying it published a
+                   non-GC host pointer as a wasm reference. A constant
+                   expression may only reference a previously-defined global
+                   (globals are initialized in index order), so the referenced
+                   global's data is already written here. */
+                get_global_data(module_inst->global_data
+                                    + ref_global->data_offset,
+                                ref_global->type.val_type, value);
             }
 #endif
             break;
