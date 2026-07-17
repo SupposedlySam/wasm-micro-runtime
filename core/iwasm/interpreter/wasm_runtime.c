@@ -1219,8 +1219,31 @@ instantiate_array_global_recursive(WASMModule *module,
                without this the raw global index is written into a ref slot,
                yielding a split/garbage pointer that later SIGBUSes. */
             if (elem_init_type == INIT_EXPR_TYPE_GET_GLOBAL) {
-                WASMValue elem_value =
-                    globals[elem_src->global_index].initial_value;
+                uint32 src_gidx = elem_src->global_index;
+                WASMValue elem_value = globals[src_gidx].initial_value;
+                /* If the referenced global is a FUNCREF, its initial_value is
+                   still the RAW FUNCTION INDEX here: funcref globals defer the
+                   index -> WASMFuncObject conversion to the global_data store
+                   pass (globals_instantiate, INIT_EXPR_TYPE_FUNCREF_CONST),
+                   which runs AFTER the const object graph is built. Storing the
+                   raw index into a (ref func) element yields a fake pointer the
+                   GC later dereferences. This is the ARRAY twin of the struct
+                   fix in patches/wamr-instantiate-struct-getglobal-funcref.patch
+                   -- structs got it in June, arrays never did. */
+                if (src_gidx >= module->import_global_count) {
+                    InitializerExpression *src_init =
+                        &module->globals[src_gidx - module->import_global_count]
+                             .init_expr;
+                    if (src_init->init_expr_type == INIT_EXPR_TYPE_FUNCREF_CONST
+                        && (uint32)elem_value.i32 != UINT32_MAX) {
+                        WASMFuncObjectRef func_obj = wasm_create_func_obj(
+                            module_inst, (uint32)elem_value.i32, false,
+                            error_buf, error_buf_size);
+                        if (!func_obj)
+                            return NULL;
+                        elem_value.gc_obj = (WASMObjectRef)func_obj;
+                    }
+                }
                 wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
             }
             /* A nested struct/array element must be instantiated recursively
@@ -1272,6 +1295,32 @@ instantiate_array_global_recursive(WASMModule *module,
                 if (!sub_obj)
                     return NULL;
                 elem_value.gc_obj = (WASMObjectRef)sub_obj;
+                wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
+            }
+            /* A `ref.func` element holds the raw FUNCTION INDEX, not a value:
+               funcref globals defer the index -> WASMFuncObject conversion to the
+               global_data store pass (globals_instantiate,
+               INIT_EXPR_TYPE_FUNCREF_CONST), which never runs for an element
+               nested inside array.new_fixed. Writing the raw index into a
+               (ref func) slot yields a fake pointer whose low bits are the func
+               index -- the GC dereferences it later and dies. The struct path has
+               resolved this since the June const-init fixes (see WASM_TYPE_FUNC
+               above); the array path never did, so `ref.func $m array.new_fixed`
+               produced a null/garbage element and `call_ref` trapped with
+               "null function reference". Mirror the struct path exactly. */
+            else if (elem_init_type == INIT_EXPR_TYPE_FUNCREF_CONST) {
+                WASMValue elem_value = *elem_src;
+                WASMFuncObjectRef func_obj = NULL;
+                /* UINT32_MAX indicates that it is a null reference */
+                if (elem_src->u32 != UINT32_MAX) {
+                    if (!(func_obj = wasm_create_func_obj(module_inst,
+                                                          elem_src->u32, false,
+                                                          error_buf,
+                                                          error_buf_size))) {
+                        return NULL;
+                    }
+                }
+                elem_value.gc_obj = (WASMObjectRef)func_obj;
                 wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
             }
             /* Plain constant (i31.new, ref.null, i32/i64, etc.): the value
