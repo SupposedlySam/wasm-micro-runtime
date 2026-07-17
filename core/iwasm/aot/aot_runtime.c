@@ -374,6 +374,24 @@ resolve_const_init_value(AOTModuleInstance *module_inst, AOTModule *module,
         return true;
     }
 
+    /* A field/element that is itself a NESTED struct.new / array.new* is stored
+       with init-kind 0xFB (WASM_OP_GC_PREFIX -- the raw GC-op prefix, since these
+       come from a multibyte GC opcode rather than a synthetic INIT_EXPR_TYPE_*
+       constant). It is not representable in the .aot: the emitter writes each field
+       FLAT, so a nested compound serialized the loader's .data metadata POINTER,
+       not the object -- storing that into a ref slot yields a fake pointer the GC
+       dereferences (SIGSEGV). The interpreter resolves this by recursing on the
+       field TYPE (instantiate_struct_global_recursive); the AOT format has no
+       recursive encoding for it. Until it does, FAIL LOUDLY at load rather than
+       store garbage. dart2wasm does not emit this shape (it references shared
+       sub-objects via global.get), so real modules are unaffected. */
+    if (init_types[idx] == 0xFB /* WASM_OP_GC_PREFIX */) {
+        set_error_buf(error_buf, error_buf_size,
+                      "nested struct.new/array.new in a struct/array field of a "
+                      "constant global is not supported by the AOT loader");
+        return false;
+    }
+
     /* A `ref.func` field/element: the producer stored the raw FUNCTION INDEX.
        The whole-global case is resolved by global_instantiate's
        INIT_EXPR_TYPE_FUNCREF_CONST arm, but a ref.func nested INSIDE a
