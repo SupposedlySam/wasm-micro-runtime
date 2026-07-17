@@ -84,7 +84,15 @@
 #endif
 
 #define AOT_MAGIC_NUMBER 0x746f6100
-#define AOT_CURRENT_VERSION 6
+/* 7 (pebble fork): the struct.new constant-expression encoding now carries a
+   per-field init-expr kind, so the runtime can tell a `global.get` field from a
+   literal one. Without it the .aot was LOSSY -- it stored a global index where a
+   value belonged, with no marker -- and dart2wasm vtables (global.get of a
+   funcref global -> struct.new) got a raw index written into a (ref func) field:
+   a fake pointer the GC then dereferenced (SIGBUS). Bumped so a v6 .aot fails
+   LOUDLY at load instead of being misparsed by the v7 loader -- there is a 13MB
+   v6 module sitting in the watch's DART_MODULE flash right now. */
+#define AOT_CURRENT_VERSION 7
 
 #ifndef WASM_ENABLE_JIT
 #define WASM_ENABLE_JIT 0

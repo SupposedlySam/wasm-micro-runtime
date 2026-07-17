@@ -250,8 +250,18 @@ get_init_expr_size(const AOTCompContext *comp_ctx, const AOTCompData *comp_data,
             WASMStructNewInitValues *struct_new_init_values =
                 (WASMStructNewInitValues *)expr->u.unary.v.data;
 
-            /* type_index + field_count + fields */
+            /* type_index + field_count + field_init_types + fields */
             size += sizeof(uint32) + sizeof(uint32);
+
+            /* Per-field init-expr kind, one u32 each. Without this the .aot is
+               LOSSY: a `global.get` field stores the GLOBAL INDEX in the same
+               u32 slot a literal value would use, so the runtime cannot tell
+               them apart and writes a raw index into the field. Emitted as u32
+               (not u8) to keep every following field naturally aligned -- the
+               loader's TEMPLATE_READ auto-aligns but EMIT_U32 does not, so a
+               packed u8 array here would silently desync the two. The format
+               already rounds sub-word fields up to u32, so this matches it. */
+            size += sizeof(uint32) * struct_new_init_values->count;
 
             bh_assert(struct_new_init_values->type_idx < module->type_count);
 
@@ -312,6 +322,11 @@ get_init_expr_size(const AOTCompContext *comp_ctx, const AOTCompData *comp_data,
                 if (elem_size < sizeof(uint32))
                     elem_size = sizeof(uint32);
                 size += sizeof(uint32) * 3 + (uint64)elem_size * value_count;
+                /* Per-element init-expr kind, one u32 each -- same reasoning as
+                   STRUCT_NEW's field_init_types above (the .aot was equally
+                   lossy for array elements: a `global.get` element stored the
+                   GLOBAL INDEX where a reference belongs). */
+                size += sizeof(uint32) * (uint64)value_count;
             }
             break;
         }
@@ -1890,6 +1905,17 @@ aot_emit_init_expr(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
             bh_assert(struct_type);
             bh_assert(struct_type->field_count == init_values->count);
 
+            /* Per-field init-expr kind (see get_init_expr_size). wamrc loads the
+               .wasm with the interpreter's loader, so field_init_types is already
+               populated here -- we were simply dropping it on the floor. Emit 0
+               (INIT_EXPR_NONE) if a producer didn't record kinds; the loader
+               treats that as "no types" and behaves exactly as before. */
+            for (i = 0; i < init_values->count; i++) {
+                EMIT_U32(init_values->field_init_types
+                             ? init_values->field_init_types[i]
+                             : 0);
+            }
+
             for (i = 0; i < init_values->count; i++) {
                 uint32 field_size = wasm_value_type_size_internal(
                     struct_type->fields[i].field_type, comp_ctx->pointer_size);
@@ -1946,6 +1972,13 @@ aot_emit_init_expr(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
 
             field_size = wasm_value_type_size_internal(array_type->elem_type,
                                                        comp_ctx->pointer_size);
+
+            /* Per-element init-expr kind (see get_init_expr_size). */
+            for (i = 0; i < value_count; i++) {
+                EMIT_U32(init_values->elem_init_types
+                             ? init_values->elem_init_types[i]
+                             : 0);
+            }
 
             for (i = 0; i < value_count; i++) {
                 if (field_size <= sizeof(uint32))

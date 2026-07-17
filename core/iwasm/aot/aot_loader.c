@@ -1271,8 +1271,12 @@ load_init_expr(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
             read_uint32(buf, buf_end, type_idx);
             read_uint32(buf, buf_end, field_count);
 
+            /* Same layout contract as the interpreter's loader: the per-field
+               init-expr kinds live in this allocation, right after
+               fields[field_count]. */
             size = offsetof(WASMStructNewInitValues, fields)
-                   + sizeof(WASMValue) * (uint64)field_count;
+                   + sizeof(WASMValue) * (uint64)field_count
+                   + (uint64)field_count;
             if (!(init_values =
                       loader_malloc(size, error_buf, error_buf_size))) {
                 return false;
@@ -1280,6 +1284,8 @@ load_init_expr(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
             free_if_fail = true;
             init_values->count = field_count;
             init_values->type_idx = type_idx;
+            init_values->field_init_types =
+                field_count ? (uint8 *)&init_values->fields[field_count] : NULL;
             expr->u.unary.v.data = init_values;
 
             if (type_idx >= module->type_count) {
@@ -1298,6 +1304,13 @@ load_init_expr(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
 
             if (field_count > 0) {
                 uint32 i;
+
+                /* Per-field init-expr kinds, one u32 each (see the emitter). */
+                for (i = 0; i < field_count; i++) {
+                    uint32 init_type;
+                    read_uint32(buf, buf_end, init_type);
+                    init_values->field_init_types[i] = (uint8)init_type;
+                }
 
                 for (i = 0; i < field_count; i++) {
                     uint32 field_size =
@@ -1346,8 +1359,12 @@ load_init_expr(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
             }
             else {
                 uint32 i, elem_size, elem_data_count;
+                /* Same layout contract as the interpreter's loader: the
+                   per-element init-expr kinds live in this allocation, right
+                   after elem_data[length]. */
                 uint64 size = offsetof(WASMArrayNewInitValues, elem_data)
-                              + sizeof(WASMValue) * (uint64)length;
+                              + sizeof(WASMValue) * (uint64)length
+                              + sizeof(uint8) * (uint64)length;
                 if (!(init_values =
                           loader_malloc(size, error_buf, error_buf_size))) {
                     return false;
@@ -1357,11 +1374,21 @@ load_init_expr(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
 
                 init_values->type_idx = type_idx;
                 init_values->length = length;
+                init_values->elem_init_types =
+                    length ? (uint8 *)&init_values->elem_data[length] : NULL;
 
                 elem_data_count =
                     (init_expr_type == INIT_EXPR_TYPE_ARRAY_NEW_FIXED) ? length
                                                                        : 1;
                 elem_size = wasm_value_type_size((uint8)array_elem_type);
+
+                /* Per-element init-expr kinds, one u32 each (see the emitter). */
+                for (i = 0; i < elem_data_count; i++) {
+                    uint32 init_type;
+                    read_uint32(buf, buf_end, init_type);
+                    if (init_values->elem_init_types)
+                        init_values->elem_init_types[i] = (uint8)init_type;
+                }
 
                 for (i = 0; i < elem_data_count; i++) {
                     if (elem_size <= sizeof(uint32))

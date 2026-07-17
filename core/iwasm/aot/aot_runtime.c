@@ -334,6 +334,89 @@ get_global_data(const uint8 *global_data, uint8 type, WASMValue *value)
     }
 }
 
+#if WASM_ENABLE_GC != 0
+/**
+ * Resolve the value to STORE into a struct.new field or array.new* element of
+ * a constant expression.
+ *
+ * raw[idx] holds whatever the producer recorded; for an
+ * INIT_EXPR_TYPE_GET_GLOBAL field that is the referenced global's INDEX, not a
+ * value. Storing it raw writes a global index into the field -- and for
+ * dart2wasm's vtable pattern (`global.get $funcref_global ... struct.new
+ * $#Vtable`) the field is a (ref func), so the result is a fake pointer that the
+ * GC later dereferences and dies on (SIGBUS), not a clean trap.
+ *
+ * The referenced global's COMPUTED value already exists in global_data: a
+ * constant expression may only reference a previously-declared global, and
+ * globals are initialized in index order, so by the time a struct global is
+ * built the funcref global's index -> WASMFuncObject conversion (see
+ * INIT_EXPR_TYPE_FUNCREF_CONST in global_instantiate) has already happened.
+ * Read it back rather than re-deriving it -- same reasoning as
+ * get_init_value_recursive's GET_GLOBAL case.
+ *
+ * The interpreter has had this since June
+ * (patches/wamr-instantiate-struct-getglobal-funcref.patch); AOT could not do it
+ * at all until the .aot format started carrying per-field init kinds, because
+ * the runtime could not tell a global.get field from a literal one.
+ */
+static bool
+resolve_const_init_value(AOTModuleInstance *module_inst, AOTModule *module,
+                         const WASMValue *raw, const uint8 *init_types,
+                         uint32 idx, WASMValue *value, char *error_buf,
+                         uint32 error_buf_size)
+{
+    uint32 global_idx;
+
+    *value = *raw;
+
+    /* Producer recorded no per-field/element kinds: behave exactly as before. */
+    if (!init_types) {
+        return true;
+    }
+
+    /* A `ref.func` field/element: the producer stored the raw FUNCTION INDEX.
+       The whole-global case is resolved by global_instantiate's
+       INIT_EXPR_TYPE_FUNCREF_CONST arm, but a ref.func nested INSIDE a
+       struct.new/array.new* never was -- so a (ref func) field kept the index and
+       became a fake pointer. This is dart2wasm's vtable shape:
+       `ref.func $method ... struct.new $#Vtable`. */
+    if (init_types[idx] == INIT_EXPR_TYPE_FUNCREF_CONST) {
+        WASMFuncObjectRef func_obj = NULL;
+
+        if (value->u32 != UINT32_MAX) {
+            if (!(func_obj = aot_create_func_obj(module_inst, value->u32, false,
+                                                 error_buf, error_buf_size))) {
+                return false;
+            }
+        }
+        value->gc_obj = (WASMObjectRef)func_obj;
+        return true;
+    }
+
+    if (init_types[idx] != INIT_EXPR_TYPE_GET_GLOBAL) {
+        return true;
+    }
+
+    global_idx = value->global_index;
+    if (!check_global_init_expr(module, global_idx, error_buf,
+                                error_buf_size)) {
+        return false;
+    }
+
+    if (global_idx < module->import_global_count) {
+        *value = module->import_globals[global_idx].global_data_linked;
+    }
+    else {
+        AOTGlobal *ref_global =
+            &module->globals[global_idx - module->import_global_count];
+        get_global_data(module_inst->global_data + ref_global->data_offset,
+                        ref_global->type.val_type, value);
+    }
+
+    return true;
+}
+#endif /* end of WASM_ENABLE_GC != 0 */
+
 static bool
 assign_table_init_value(AOTModuleInstance *module_inst, AOTModule *module,
                         InitializerExpression *init_expr, void *addr,
@@ -441,8 +524,16 @@ assign_table_init_value(AOTModuleInstance *module_inst, AOTModule *module,
 
                 for (field_idx = 0; field_idx < init_values->count;
                      field_idx++) {
+                    WASMValue field_value;
+                    if (!resolve_const_init_value(
+                            module_inst, module,
+                            &init_values->fields[field_idx],
+                            init_values->field_init_types, field_idx,
+                            &field_value, error_buf, error_buf_size)) {
+                        return false;
+                    }
                     wasm_struct_obj_set_field(struct_obj, field_idx,
-                                              &init_values->fields[field_idx]);
+                                              &field_value);
                 }
             }
 
@@ -501,8 +592,15 @@ assign_table_init_value(AOTModuleInstance *module_inst, AOTModule *module,
                 bh_assert(init_values);
 
                 for (elem_idx = 0; elem_idx < len; elem_idx++) {
-                    wasm_array_obj_set_elem(array_obj, elem_idx,
-                                            &init_values->elem_data[elem_idx]);
+                    WASMValue elem_value;
+                    if (!resolve_const_init_value(
+                            module_inst, module,
+                            &init_values->elem_data[elem_idx],
+                            init_values->elem_init_types, elem_idx,
+                            &elem_value, error_buf, error_buf_size)) {
+                        return false;
+                    }
+                    wasm_array_obj_set_elem(array_obj, elem_idx, &elem_value);
                 }
             }
 
@@ -745,9 +843,16 @@ global_instantiate(AOTModuleInstance *module_inst, AOTModule *module,
 
                     for (field_idx = 0; field_idx < init_values->count;
                          field_idx++) {
-                        wasm_struct_obj_set_field(
-                            struct_obj, field_idx,
-                            &init_values->fields[field_idx]);
+                        WASMValue field_value;
+                        if (!resolve_const_init_value(
+                                module_inst, module,
+                                &init_values->fields[field_idx],
+                                init_values->field_init_types, field_idx,
+                                &field_value, error_buf, error_buf_size)) {
+                            return false;
+                        }
+                        wasm_struct_obj_set_field(struct_obj, field_idx,
+                                                  &field_value);
                     }
                 }
 
@@ -807,9 +912,16 @@ global_instantiate(AOTModuleInstance *module_inst, AOTModule *module,
                     bh_assert(init_values);
 
                     for (elem_idx = 0; elem_idx < len; elem_idx++) {
-                        wasm_array_obj_set_elem(
-                            array_obj, elem_idx,
-                            &init_values->elem_data[elem_idx]);
+                        WASMValue elem_value;
+                        if (!resolve_const_init_value(
+                                module_inst, module,
+                                &init_values->elem_data[elem_idx],
+                                init_values->elem_init_types, elem_idx,
+                                &elem_value, error_buf, error_buf_size)) {
+                            return false;
+                        }
+                        wasm_array_obj_set_elem(array_obj, elem_idx,
+                                                &elem_value);
                     }
                 }
 
